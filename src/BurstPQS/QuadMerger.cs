@@ -23,7 +23,7 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
     internal static bool Enabled = true;
 
     // Renderer checks cross into native code, so only this many families are
-    // checked each frame. PQ fields are checked for every family every frame.
+    // rechecked each frame. PQ fields are checked for every family every frame.
     const int ChecksPerFrame = 16;
 
     // A family that failed the renderer checks is retried after this many frames.
@@ -34,10 +34,13 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
     static readonly long CopyBudget = Stopwatch.Frequency / 4000;
 
     // Accumulated cost, for profiling.
-    internal static long CheckTicks;
+    internal static long IntactTicks;
+    internal static long RecheckTicks;
+    internal static long ScanTicks;
     internal static long CopyTicks;
     internal static int CopiedQuads;
     internal static int Frames;
+    static int lastFrame = -1;
 
     static readonly ProfilerMarker ReconcileMarker = new("QuadMerger.Reconcile");
 
@@ -120,7 +123,11 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         long start = Stopwatch.GetTimestamp();
 
         frame++;
-        Frames++;
+        if (Time.frameCount != lastFrame)
+        {
+            lastFrame = Time.frameCount;
+            Frames++;
+        }
         if (frame % RejectFrames == 0)
             rejected.Clear();
 
@@ -130,23 +137,23 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
                 RemoveAt(i);
         }
 
+        long recheckStart = Stopwatch.GetTimestamp();
+        IntactTicks += recheckStart - start;
+
+        // A family that no longer matches is dissolved, and formed again below
+        // if its children still render alike.
         int checks = Mathf.Min(ChecksPerFrame, groupList.Count);
         for (int n = 0; n < checks && groupList.Count != 0; ++n)
         {
             checkCursor %= groupList.Count;
-            var group = groupList[checkCursor];
-            if (DrawsAlike(group.parent))
-            {
-                if (group.merged)
-                    SyncRenderer(group);
+            if (StillRendersAlike(groupList[checkCursor]))
                 checkCursor++;
-            }
             else
-            {
-                rejected.Add(group.parent);
                 RemoveAt(checkCursor);
-            }
         }
+
+        long scanStart = Stopwatch.GetTimestamp();
+        RecheckTicks += scanStart - recheckStart;
 
         foreach (var quad in activeQuads)
         {
@@ -166,7 +173,7 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         }
 
         long copyStart = Stopwatch.GetTimestamp();
-        CheckTicks += copyStart - start;
+        ScanTicks += copyStart - scanStart;
 
         long deadline = copyStart + CopyBudget;
         int count = groupList.Count;
@@ -189,7 +196,6 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
                 continue;
             }
 
-            SyncRenderer(group);
             SetMerged(group, true);
         }
         if (count != 0)
@@ -226,6 +232,7 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         group.renderer.enabled = false;
         for (int i = 0; i < 4; ++i)
             group.children[i] = parent.subNodes[i];
+        SyncRenderer(group);
 
         groups.Add(parent, group);
         groupList.Add(group);
@@ -339,6 +346,25 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         return true;
     }
 
+    // The part of DrawsAlike that can change after a family forms: Parallax
+    // swaps materials and meshes near the camera, EVE adds materials, and
+    // Scatterer disables the stock ocean's renderers.
+    static bool StillRendersAlike(Group group)
+    {
+        group.renderer.GetSharedMaterials(MaterialsA);
+        foreach (var child in group.children)
+        {
+            var renderer = child.meshRenderer;
+            if (!renderer.enabled || !ReferenceEquals(child.meshFilter.sharedMesh, child.mesh))
+                return false;
+
+            renderer.GetSharedMaterials(MaterialsB);
+            if (!SameList(MaterialsA, MaterialsB))
+                return false;
+        }
+        return true;
+    }
+
     static bool RendersSame(Renderer a, Renderer b) =>
         a.gameObject.layer == b.gameObject.layer
         && a.shadowCastingMode == b.shadowCastingMode
@@ -352,12 +378,17 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
     {
         a.GetSharedMaterials(MaterialsA);
         b.GetSharedMaterials(MaterialsB);
-        if (MaterialsA.Count != MaterialsB.Count)
+        return SameList(MaterialsA, MaterialsB);
+    }
+
+    static bool SameList(List<Material> a, List<Material> b)
+    {
+        if (a.Count != b.Count)
             return false;
 
-        for (int i = 0; i < MaterialsA.Count; ++i)
+        for (int i = 0; i < a.Count; ++i)
         {
-            if (!ReferenceEquals(MaterialsA[i], MaterialsB[i]))
+            if (!ReferenceEquals(a[i], b[i]))
                 return false;
         }
         return true;
