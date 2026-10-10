@@ -225,7 +225,7 @@ public class BatchPQS : MonoBehaviour
     // Merging relies on quads being placed by PlaceQuad.
     internal bool CanMergeQuads => ManagesQuadPlacement && pqs.isActive;
 
-    // Called whenever a quad's mesh data changes.
+    // Called when a quad's mesh changes in a way the merger can't mirror.
     internal static void OnQuadMeshChanged(PQ quad)
     {
         Get(quad.sphereRoot)?.merger.MarkDirty(quad);
@@ -594,10 +594,10 @@ public class BatchPQS : MonoBehaviour
     internal static void SetQuadTriangles(Mesh mesh, int[] indices, PQ quad)
     {
         QuadColliderBaker.CompleteBake();
-        OnQuadMeshChanged(quad);
         int vertexCount = mesh.vertexCount;
         if (vertexCount != PQS.cacheVertCount)
         {
+            OnQuadMeshChanged(quad);
             mesh.triangles = indices;
             return;
         }
@@ -609,6 +609,7 @@ public class BatchPQS : MonoBehaviour
             vertexCount,
             MeshUpdateFlags.DontValidateIndices | MeshUpdateFlags.DontResetBoneBounds
         );
+        Get(quad.sphereRoot)?.merger.MirrorIndices(quad, indices);
     }
 
     const int MaxVertexStreams = 4;
@@ -635,7 +636,6 @@ public class BatchPQS : MonoBehaviour
 
     internal static void BeginQuadStreamUpdates(PQ quad)
     {
-        OnQuadMeshChanged(quad);
         edgeNormalsQuad = quad;
         layoutMesh = null;
     }
@@ -654,10 +654,16 @@ public class BatchPQS : MonoBehaviour
     // the setters' layout changes, validation and notifications. Returns false
     // if the mesh has some other layout, in which case the caller should use
     // the regular setter.
-    internal static bool TrySetQuadStream<T>(Mesh mesh, T[] data, VertexAttribute attribute)
+    internal static bool TrySetQuadStream<T>(
+        Mesh mesh,
+        T[] data,
+        VertexAttribute attribute,
+        PQ quad
+    )
         where T : struct
     {
         QuadColliderBaker.CompleteBake();
+        var merger = quad is null ? null : Get(quad.sphereRoot)?.merger;
 
         if (!ReferenceEquals(mesh, layoutMesh))
             ReadStreamLayout(mesh);
@@ -671,10 +677,12 @@ public class BatchPQS : MonoBehaviour
         {
             // The caller's setter may change the layout.
             layoutMesh = null;
+            merger?.MarkDirty(quad);
             return false;
         }
 
         mesh.SetVertexBufferData(data, 0, 0, data.Length, stream, StreamUpdateFlags);
+        merger?.MirrorStream(quad, data, stream);
         return true;
     }
 
@@ -708,7 +716,7 @@ public class BatchPQS : MonoBehaviour
 
     internal static void SetQuadNormals(Mesh mesh, Vector3[] normals)
     {
-        if (!TrySetQuadStream(mesh, normals, VertexAttribute.Normal))
+        if (!TrySetQuadStream(mesh, normals, VertexAttribute.Normal, edgeNormalsQuad))
             mesh.normals = normals;
     }
 
@@ -1567,6 +1575,16 @@ public class BatchPQS : MonoBehaviour
 
             SetIndices(mesh, indices, meshData.bounds, vertexCount, flags);
             mesh.bounds = meshData.bounds;
+            batchPQS.merger.MirrorBuild(
+                quad,
+                hasTangents ? AttrWithTangent : AttrWithoutTangent,
+                meshData.interleaved,
+                meshData.normals,
+                meshData.tangents,
+                meshData.cacheUV2s,
+                indices,
+                meshData.bounds
+            );
 
             // Populate global PQS cache arrays that stock normally fills per-vertex.
             // These must be populated before OnMeshBuilt since stock PQSMods may read them.
@@ -1590,7 +1608,6 @@ public class BatchPQS : MonoBehaviour
 
             // OnQuadBuilt mods may change fields used by the snapshot.
             batchPQS.InvalidateQuadSnapshot(quad);
-            batchPQS.merger.MarkDirty(quad);
             batchPQS.merger.MarkChanged(quad);
         }
 

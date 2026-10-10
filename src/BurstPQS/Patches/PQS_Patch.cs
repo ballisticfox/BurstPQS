@@ -153,7 +153,6 @@ internal static class PQS_BuildTangents_Patch
 
     static unsafe bool Prefix(PQ quad)
     {
-        BatchPQS.OnQuadMeshChanged(quad);
         BuildTangentsFunc ??= BurstUtil.MaybeCompileDelegate<BuildTangentsDelegate>(BuildTangents);
 
         Vector3[] normals;
@@ -194,7 +193,14 @@ internal static class PQS_BuildTangents_Patch
             );
         }
 
-        if (!BatchPQS.TrySetQuadStream(quad.mesh, PQS.cacheTangents, VertexAttribute.Tangent))
+        if (
+            !BatchPQS.TrySetQuadStream(
+                quad.mesh,
+                PQS.cacheTangents,
+                VertexAttribute.Tangent,
+                quad
+            )
+        )
             quad.mesh.tangents = PQS.cacheTangents;
         return false;
     }

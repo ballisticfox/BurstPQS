@@ -80,7 +80,14 @@ public class UVPlanetRelativePosition(PQSMod_UVPlanetRelativePosition mod)
             );
         }
 
-        if (!BatchPQS.TrySetQuadStream(quad.mesh, PQS.cacheUV2s, VertexAttribute.TexCoord1))
+        if (
+            !BatchPQS.TrySetQuadStream(
+                quad.mesh,
+                PQS.cacheUV2s,
+                VertexAttribute.TexCoord1,
+                quad
+            )
+        )
             quad.mesh.uv2 = PQS.cacheUV2s;
     }
 

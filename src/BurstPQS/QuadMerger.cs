@@ -1,5 +1,7 @@
 using System.Collections.Generic;
 using BurstPQS.Util;
+using Unity.Burst;
+using Unity.Collections;
 using Unity.Profiling;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -18,6 +20,12 @@ namespace BurstPQS;
 // Nothing else about the quads changes. They keep their meshes and colliders,
 // and meshRenderer.enabled keeps meaning "this quad is visible" for stock and
 // for mods.
+//
+// The family mesh has the same vertex layout as its quads, with each quad in
+// its own slice. When a family forms, its quads are read back from their
+// meshes. After that, every write BatchPQS makes to a quad's mesh is also
+// made to its slice, so quads never need to be read back again.
+[BurstCompile]
 internal sealed class QuadMerger(BatchPQS batchPQS)
 {
     internal static bool Enabled = true;
@@ -30,36 +38,52 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
     // A family that failed the renderer checks is retried after this many frames.
     const int RejectFrames = 60;
 
-    // Main thread time per frame for copying child meshes. Families still
+    // Main thread time per frame for reading back quads. Families still
     // waiting draw their children until they are copied.
     static readonly long CopyBudget = Stopwatch.Frequency / 4000;
+
+    // Unused family objects kept for reuse, per sphere.
+    const int MaxPooled = 256;
 
     // Accumulated cost, for profiling.
     internal static long RecheckTicks;
     internal static long ChangeTicks;
     internal static long CopyTicks;
+    internal static long MirrorTicks;
     internal static int CopiedQuads;
+    internal static int MirroredWrites;
     internal static int Frames;
     static int lastFrame = -1;
 
     static readonly ProfilerMarker ReconcileMarker = new("QuadMerger.Reconcile");
+
+    // The objects that draw a family. Pooled and reused across families.
+    sealed class Shell
+    {
+        public GameObject gameObject;
+        public MeshRenderer renderer;
+        public Mesh mesh;
+
+        // The vertex layout the mesh was created with, or null.
+        public VertexAttributeDescriptor[] attributes;
+
+        // Floats per vertex in each stream, and each attribute's offset in
+        // floats within its stream.
+        public readonly int[] strides = new int[4];
+        public readonly int[] offsets = new int[VertexAttributeCount];
+    }
 
     sealed class Group
     {
         public PQ parent;
         public readonly PQ[] children = new PQ[4];
         public readonly Bounds[] bounds = new Bounds[4];
-        public GameObject gameObject;
-        public MeshRenderer renderer;
-        public Mesh mesh;
+        public Shell shell;
 
-        // The vertex layout the mesh was created with, or -1.
-        public int layout = -1;
-
-        // Children whose part of the mesh is out of date.
+        // Children whose slice is out of date and must be read back.
         public int stale = 0xF;
 
-        // Whether the merged mesh is drawn instead of the children.
+        // Whether the family mesh is drawn instead of the children.
         public bool merged;
 
         // Set when a child could not be copied, until a child changes again.
@@ -68,15 +92,18 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         // Whether the group is in copyQueue.
         public bool queued;
 
-        // Set once dissolved. Destroy only takes effect at the end of the frame.
+        // Set once dissolved, for references still held in copyQueue.
         public bool removed;
 
         // Position in groupList.
         public int index;
     }
 
+    const int VertexAttributeCount = (int)VertexAttribute.BlendIndices + 1;
+
     readonly Dictionary<PQ, Group> groups = [];
     readonly List<Group> groupList = [];
+    readonly Stack<Shell> pool = [];
     readonly HashSet<PQ> rejected = [];
     readonly HashSet<PQ> changed = [];
     readonly List<Group> copyQueue = [];
@@ -87,13 +114,21 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
 
     static readonly List<Material> MaterialsA = [];
     static readonly List<Material> MaterialsB = [];
-    static readonly List<VertexAttributeDescriptor> Attributes = [];
+    static readonly VertexAttributeDescriptor[] AttributeScratch = new VertexAttributeDescriptor[
+        VertexAttributeCount
+    ];
     static readonly List<Vector2> Vector2Scratch = [];
     static readonly List<Vector3> Vector3Scratch = [];
     static readonly List<Vector4> Vector4Scratch = [];
     static readonly List<Color> ColorScratch = [];
     static readonly List<int> IndexScratch = [];
-    static float[] InterleavedScratch = [];
+    static readonly float[][] StreamScratch =
+    [
+        [],
+        [],
+        [],
+        [],
+    ];
     static ushort[] IndexSlice = [];
 
     const MeshUpdateFlags UpdateFlags =
@@ -104,22 +139,17 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
     static int VertsPerQuad => PQS.cacheVertCount;
     static int IndicesPerQuad => PQS.cacheIndices[0].Length;
 
-    // A quad's mesh changed, so its part of the family mesh must be copied again.
+    #region Change tracking
+    // A quad's mesh changed in a way that was not mirrored, so its slice must
+    // be read back.
     internal void MarkDirty(PQ quad)
     {
-        var parent = quad.parent;
-        if (parent is null || !groups.TryGetValue(parent, out var group))
+        if (!TryGetSlice(quad, out var group, out int index))
             return;
 
-        for (int i = 0; i < 4; ++i)
-        {
-            if (ReferenceEquals(group.children[i], quad))
-            {
-                group.stale |= 1 << i;
-                group.failed = false;
-                Queue(group);
-            }
-        }
+        group.stale |= 1 << index;
+        group.failed = false;
+        Queue(group);
     }
 
     // A quad was subdivided, collapsed, built or shown or hidden, which can
@@ -132,12 +162,165 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
             changed.Add(parent);
     }
 
+    bool TryGetSlice(PQ quad, out Group group, out int index)
+    {
+        index = -1;
+        var parent = quad.parent;
+        if (parent is null || !groups.TryGetValue(parent, out group))
+        {
+            group = null;
+            return false;
+        }
+
+        for (int i = 0; i < 4; ++i)
+        {
+            if (ReferenceEquals(group.children[i], quad))
+            {
+                index = i;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Whether writes to this quad's mesh can be mirrored into its slice. A
+    // stale slice is read back in full later instead.
+    bool TryGetMirror(PQ quad, out Group group, out int index) =>
+        TryGetSlice(quad, out group, out index)
+        && (group.stale & (1 << index)) == 0
+        && group.shell.attributes is not null;
+    #endregion
+
+    #region Mirroring
+    // PendingBuild.Complete uploaded a freshly built quad.
+    internal void MirrorBuild(
+        PQ quad,
+        VertexAttributeDescriptor[] attributes,
+        NativeArray<InterleavedVertex> interleaved,
+        NativeArray<Vector3> normals,
+        NativeArray<Vector4> tangents,
+        NativeArray<Vector2> uv1s,
+        int[] indices,
+        Bounds bounds
+    )
+    {
+        if (!TryGetMirror(quad, out var group, out int index))
+            return;
+
+        var shell = group.shell;
+        if (!SameLayout(shell.attributes, attributes, attributes.Length))
+        {
+            MarkDirty(quad);
+            return;
+        }
+
+        long start = Stopwatch.GetTimestamp();
+        var mesh = shell.mesh;
+        int vertexCount = VertsPerQuad;
+        int baseVertex = index * vertexCount;
+        var offset = SliceOffset(group, quad);
+
+        var shifted = new NativeArray<InterleavedVertex>(
+            vertexCount,
+            Allocator.Temp,
+            NativeArrayOptions.UninitializedMemory
+        );
+        OffsetPositionsFunc ??= BurstUtil.MaybeCompileDelegate<OffsetPositionsDelegate>(
+            OffsetPositions
+        );
+        OffsetPositionsFunc(interleaved, shifted, offset);
+        mesh.SetVertexBufferData(shifted, 0, baseVertex, vertexCount, 0, UpdateFlags);
+        shifted.Dispose();
+
+        mesh.SetVertexBufferData(normals, 0, baseVertex, vertexCount, 1, UpdateFlags);
+        int uv1Stream = 2;
+        if (tangents.IsCreated)
+        {
+            mesh.SetVertexBufferData(tangents, 0, baseVertex, vertexCount, 2, UpdateFlags);
+            uv1Stream = 3;
+        }
+        mesh.SetVertexBufferData(uv1s, 0, baseVertex, vertexCount, uv1Stream, UpdateFlags);
+        WriteIndices(mesh, indices, index);
+
+        bounds.center += offset;
+        group.bounds[index] = bounds;
+        UpdateBounds(group);
+
+        MirroredWrites++;
+        MirrorTicks += Stopwatch.GetTimestamp() - start;
+    }
+
+    // BatchPQS wrote one of the quad's single-attribute streams in place.
+    internal void MirrorStream<T>(PQ quad, T[] data, int stream)
+        where T : struct
+    {
+        if (!TryGetMirror(quad, out var group, out int index))
+            return;
+
+        long start = Stopwatch.GetTimestamp();
+        int vertexCount = VertsPerQuad;
+        group.shell.mesh.SetVertexBufferData(
+            data,
+            0,
+            index * vertexCount,
+            vertexCount,
+            stream,
+            UpdateFlags
+        );
+        MirroredWrites++;
+        MirrorTicks += Stopwatch.GetTimestamp() - start;
+    }
+
+    // PQ.UpdateVisibility changed the quad's edge stitching.
+    internal void MirrorIndices(PQ quad, int[] indices)
+    {
+        if (!TryGetMirror(quad, out var group, out int index))
+            return;
+
+        if (indices.Length != IndicesPerQuad)
+        {
+            MarkDirty(quad);
+            return;
+        }
+
+        long start = Stopwatch.GetTimestamp();
+        WriteIndices(group.shell.mesh, indices, index);
+        MirroredWrites++;
+        MirrorTicks += Stopwatch.GetTimestamp() - start;
+    }
+
+    delegate void OffsetPositionsDelegate(
+        in NativeArray<InterleavedVertex> source,
+        in NativeArray<InterleavedVertex> destination,
+        in Vector3 offset
+    );
+
+    static OffsetPositionsDelegate OffsetPositionsFunc;
+
+    [BurstCompile(FloatMode = FloatMode.Fast)]
+    static void OffsetPositions(
+        in NativeArray<InterleavedVertex> source,
+        in NativeArray<InterleavedVertex> destination,
+        in Vector3 offset
+    )
+    {
+        var output = destination;
+        for (int i = 0; i < source.Length; ++i)
+        {
+            var vertex = source[i];
+            vertex.position += offset;
+            output[i] = vertex;
+        }
+    }
+    #endregion
+
+    #region Reconcile
     // Runs once a frame, after the quad tree has been updated.
     internal void Reconcile(List<PQ> activeQuads)
     {
         if (!Enabled || !batchPQS.CanMergeQuads)
         {
-            if (groupList.Count != 0)
+            if (groupList.Count != 0 || pool.Count != 0)
                 Clear();
             changed.Clear();
             scanAll = true;
@@ -214,21 +397,24 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         foreach (var group in copyQueue)
         {
             group.queued = false;
-            if (group.stale == 0 || group.failed || group.removed)
+            if (group.failed || group.removed)
                 continue;
 
-            if (Stopwatch.GetTimestamp() > deadline)
+            if (group.stale != 0)
             {
-                SetMerged(group, false);
-                copyRequeue.Add(group);
-                continue;
-            }
+                if (Stopwatch.GetTimestamp() > deadline)
+                {
+                    SetMerged(group, false);
+                    copyRequeue.Add(group);
+                    continue;
+                }
 
-            if (!Copy(group))
-            {
-                group.failed = true;
-                SetMerged(group, false);
-                continue;
+                if (!Copy(group))
+                {
+                    group.failed = true;
+                    SetMerged(group, false);
+                    continue;
+                }
             }
 
             SetMerged(group, true);
@@ -256,26 +442,23 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         groupList.Clear();
         groups.Clear();
         copyQueue.Clear();
-    }
 
+        while (pool.Count != 0)
+        {
+            var shell = pool.Pop();
+            if (shell.gameObject.IsNotNullOrDestroyed())
+                Object.Destroy(shell.gameObject);
+            if (shell.mesh.IsNotNullOrDestroyed())
+                Object.Destroy(shell.mesh);
+        }
+    }
+    #endregion
+
+    #region Groups
     void Add(PQ parent)
     {
-        var gameObject = new GameObject("QuadGroup");
-        gameObject.layer = parent.subNodes[0].gameObject.layer;
-        gameObject.transform.SetParent(parent.transform, false);
-
-        var mesh = new Mesh { name = "QuadGroup" };
-        mesh.MarkDynamic();
-        gameObject.AddComponent<MeshFilter>().sharedMesh = mesh;
-
-        var group = new Group
-        {
-            parent = parent,
-            gameObject = gameObject,
-            renderer = gameObject.AddComponent<MeshRenderer>(),
-            mesh = mesh,
-        };
-        group.renderer.enabled = false;
+        var shell = AcquireShell(parent);
+        var group = new Group { parent = parent, shell = shell };
         for (int i = 0; i < 4; ++i)
             group.children[i] = parent.subNodes[i];
         SyncRenderer(group);
@@ -299,14 +482,63 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         groupList.RemoveAt(last);
     }
 
-    static void Dissolve(Group group)
+    void Dissolve(Group group)
     {
         SetMerged(group, false);
         group.removed = true;
-        if (group.gameObject.IsNotNullOrDestroyed())
-            Object.Destroy(group.gameObject);
-        if (group.mesh.IsNotNullOrDestroyed())
-            Object.Destroy(group.mesh);
+        ReleaseShell(group.shell);
+        group.shell = null;
+    }
+
+    Shell AcquireShell(PQ parent)
+    {
+        Shell shell = null;
+        while (pool.Count != 0 && shell is null)
+        {
+            var pooled = pool.Pop();
+            if (pooled.gameObject.IsNotNullOrDestroyed() && pooled.mesh.IsNotNullOrDestroyed())
+                shell = pooled;
+        }
+
+        if (shell is null)
+        {
+            var gameObject = new GameObject("QuadGroup");
+            var mesh = new Mesh { name = "QuadGroup" };
+            mesh.MarkDynamic();
+            gameObject.AddComponent<MeshFilter>().sharedMesh = mesh;
+            var renderer = gameObject.AddComponent<MeshRenderer>();
+            renderer.enabled = false;
+            shell = new Shell
+            {
+                gameObject = gameObject,
+                renderer = renderer,
+                mesh = mesh,
+            };
+        }
+
+        shell.gameObject.layer = parent.subNodes[0].gameObject.layer;
+        shell.gameObject.transform.SetParent(parent.transform, false);
+        return shell;
+    }
+
+    // Pooled shells wait under the sphere, so they outlive the quad they were
+    // under and are destroyed with the sphere.
+    void ReleaseShell(Shell shell)
+    {
+        if (shell.renderer.IsNotNullOrDestroyed())
+            shell.renderer.enabled = false;
+
+        if (pool.Count < MaxPooled && shell.gameObject.IsNotNullOrDestroyed())
+        {
+            shell.gameObject.transform.SetParent(batchPQS.transform, false);
+            pool.Push(shell);
+            return;
+        }
+
+        if (shell.gameObject.IsNotNullOrDestroyed())
+            Object.Destroy(shell.gameObject);
+        if (shell.mesh.IsNotNullOrDestroyed())
+            Object.Destroy(shell.mesh);
     }
 
     static void SetMerged(Group group, bool merged)
@@ -315,8 +547,9 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
             return;
         group.merged = merged;
 
-        if (group.renderer.IsNotNullOrDestroyed())
-            group.renderer.enabled = merged;
+        var renderer = group.shell?.renderer;
+        if (renderer.IsNotNullOrDestroyed())
+            renderer.enabled = merged;
 
         foreach (var child in group.children)
         {
@@ -324,9 +557,11 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
                 child.meshRenderer.forceRenderingOff = merged;
         }
     }
+    #endregion
 
+    #region Checks
     // Whether this group's quads are still the visible children of its parent.
-    // Only reads PQ fields, so it is cheap enough to run on every group.
+    // Only reads PQ fields.
     static bool IsIntact(Group group)
     {
         if (!IsFamily(group.parent))
@@ -402,7 +637,7 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
     // Scatterer disables the stock ocean's renderers.
     static bool StillRendersAlike(Group group)
     {
-        group.renderer.GetSharedMaterials(MaterialsA);
+        group.shell.renderer.GetSharedMaterials(MaterialsA);
         foreach (var child in group.children)
         {
             var renderer = child.meshRenderer;
@@ -448,7 +683,7 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
     static void SyncRenderer(Group group)
     {
         var source = group.children[0].meshRenderer;
-        var renderer = group.renderer;
+        var renderer = group.shell.renderer;
 
         if (!SameMaterials(source, renderer))
             renderer.sharedMaterials = source.sharedMaterials;
@@ -462,26 +697,30 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
             renderer.lightProbeUsage = source.lightProbeUsage;
         if (renderer.probeAnchor != source.probeAnchor)
             renderer.probeAnchor = source.probeAnchor;
+    }
+    #endregion
 
-        int layer = source.gameObject.layer;
-        if (group.gameObject.layer != layer)
-            group.gameObject.layer = layer;
+    #region Copy
+    // Every child's vertices are relative to its own (float) planet position
+    // and quads don't rotate or scale relative to each other, so a child is
+    // placed in the family mesh with a translation.
+    static Vector3 SliceOffset(Group group, PQ child)
+    {
+        Vector3 position = child.positionPlanet;
+        Vector3 origin = group.parent.positionPlanet;
+        return position - origin;
     }
 
-    // Copies each stale child into its part of the family mesh. Every child's
-    // vertices are relative to its own (float) planet position and quads don't
-    // rotate or scale relative to each other, so a child is copied with a
-    // translation.
+    // Reads each stale child back into its slice.
     static bool Copy(Group group)
     {
-        // Creating the mesh for a new layout clears it, so every child is copied again.
-        int layout = Layout(group.children[0].mesh);
-        if (layout < 0)
-            return false;
-        if (layout != group.layout)
+        var shell = group.shell;
+        int count = group.children[0].mesh.GetVertexAttributes(AttributeScratch);
+        if (shell.attributes is null || !SameLayout(shell.attributes, AttributeScratch, count))
         {
-            CreateMesh(group.mesh, layout);
-            group.layout = layout;
+            // Creating the mesh for a new layout clears it.
+            if (!CreateMesh(shell, AttributeScratch, count))
+                return false;
             group.stale = 0xF;
         }
 
@@ -497,11 +736,177 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
             CopiedQuads++;
         }
 
+        UpdateBounds(group);
+        return true;
+    }
+
+    static bool CopyChild(Group group, int index)
+    {
+        var shell = group.shell;
+        var child = group.children[index];
+        var source = child.mesh;
+        int vertexCount = VertsPerQuad;
+        if (source.vertexCount != vertexCount || source.subMeshCount != 1)
+            return false;
+
+        int count = source.GetVertexAttributes(AttributeScratch);
+        if (!SameLayout(shell.attributes, AttributeScratch, count))
+            return false;
+
+        for (int stream = 0; stream < 4; ++stream)
+        {
+            int length = shell.strides[stream] * vertexCount;
+            if (StreamScratch[stream].Length < length)
+                StreamScratch[stream] = new float[length];
+        }
+
+        var offset = SliceOffset(group, child);
+        foreach (var descriptor in shell.attributes)
+            ReadAttribute(source, descriptor, shell, offset, vertexCount);
+
+        var mesh = shell.mesh;
+        int baseVertex = index * vertexCount;
+        for (int stream = 0; stream < 4; ++stream)
+        {
+            int stride = shell.strides[stream];
+            if (stride == 0)
+                continue;
+
+            mesh.SetVertexBufferData(
+                StreamScratch[stream],
+                0,
+                baseVertex * stride,
+                vertexCount * stride,
+                stream,
+                UpdateFlags
+            );
+        }
+
+        source.GetIndices(IndexScratch, 0);
+        if (IndexScratch.Count != IndicesPerQuad)
+            return false;
+        WriteIndices(mesh, IndexScratch, index);
+
+        var bounds = source.bounds;
+        bounds.center += offset;
+        group.bounds[index] = bounds;
+        return true;
+    }
+
+    // Writes one attribute of a quad into its stream's scratch buffer.
+    static void ReadAttribute(
+        Mesh source,
+        VertexAttributeDescriptor descriptor,
+        Shell shell,
+        Vector3 offset,
+        int vertexCount
+    )
+    {
+        var attribute = descriptor.attribute;
+        int dimension = descriptor.dimension;
+        int stride = shell.strides[descriptor.stream];
+        int at = shell.offsets[(int)attribute];
+        var buffer = StreamScratch[descriptor.stream];
+
+        switch (attribute)
+        {
+            case VertexAttribute.Position:
+                source.GetVertices(Vector3Scratch);
+                for (int i = 0; i < vertexCount; ++i, at += stride)
+                {
+                    var v = Vector3Scratch[i] + offset;
+                    buffer[at] = v.x;
+                    buffer[at + 1] = v.y;
+                    buffer[at + 2] = v.z;
+                }
+                break;
+
+            case VertexAttribute.Normal:
+                source.GetNormals(Vector3Scratch);
+                for (int i = 0; i < vertexCount; ++i, at += stride)
+                {
+                    var v = Vector3Scratch[i];
+                    buffer[at] = v.x;
+                    buffer[at + 1] = v.y;
+                    buffer[at + 2] = v.z;
+                }
+                break;
+
+            case VertexAttribute.Tangent:
+                source.GetTangents(Vector4Scratch);
+                WriteVector4s(Vector4Scratch, buffer, at, stride, 4, vertexCount);
+                break;
+
+            case VertexAttribute.Color:
+                source.GetColors(ColorScratch);
+                for (int i = 0; i < vertexCount; ++i, at += stride)
+                {
+                    var c = ColorScratch[i];
+                    buffer[at] = c.r;
+                    buffer[at + 1] = c.g;
+                    buffer[at + 2] = c.b;
+                    buffer[at + 3] = c.a;
+                }
+                break;
+
+            default:
+                int channel = attribute - VertexAttribute.TexCoord0;
+                if (dimension == 2)
+                {
+                    source.GetUVs(channel, Vector2Scratch);
+                    for (int i = 0; i < vertexCount; ++i, at += stride)
+                    {
+                        var v = Vector2Scratch[i];
+                        buffer[at] = v.x;
+                        buffer[at + 1] = v.y;
+                    }
+                }
+                else
+                {
+                    source.GetUVs(channel, Vector4Scratch);
+                    WriteVector4s(Vector4Scratch, buffer, at, stride, dimension, vertexCount);
+                }
+                break;
+        }
+    }
+
+    static void WriteVector4s(
+        List<Vector4> values,
+        float[] buffer,
+        int at,
+        int stride,
+        int dimension,
+        int vertexCount
+    )
+    {
+        for (int i = 0; i < vertexCount; ++i, at += stride)
+        {
+            var v = values[i];
+            for (int c = 0; c < dimension; ++c)
+                buffer[at + c] = v[c];
+        }
+    }
+
+    static void WriteIndices(Mesh mesh, IList<int> indices, int index)
+    {
+        int indexCount = IndicesPerQuad;
+        if (IndexSlice.Length != indexCount)
+            IndexSlice = new ushort[indexCount];
+
+        int baseVertex = index * VertsPerQuad;
+        for (int i = 0; i < indexCount; ++i)
+            IndexSlice[i] = (ushort)(indices[i] + baseVertex);
+        mesh.SetIndexBufferData(IndexSlice, 0, index * indexCount, indexCount, UpdateFlags);
+    }
+
+    static void UpdateBounds(Group group)
+    {
         var bounds = group.bounds[0];
         for (int i = 1; i < 4; ++i)
             bounds.Encapsulate(group.bounds[i]);
 
-        group.mesh.SetSubMesh(
+        var mesh = group.shell.mesh;
+        mesh.SetSubMesh(
             0,
             new SubMeshDescriptor(0, 4 * IndicesPerQuad)
             {
@@ -511,204 +916,56 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
             },
             UpdateFlags
         );
-        group.mesh.bounds = bounds;
+        mesh.bounds = bounds;
+    }
+
+    static bool SameLayout(VertexAttributeDescriptor[] a, VertexAttributeDescriptor[] b, int count)
+    {
+        if (a is null || a.Length != count)
+            return false;
+
+        for (int i = 0; i < count; ++i)
+        {
+            if (
+                a[i].attribute != b[i].attribute
+                || a[i].format != b[i].format
+                || a[i].dimension != b[i].dimension
+                || a[i].stream != b[i].stream
+            )
+                return false;
+        }
         return true;
     }
 
-    static bool CopyChild(Group group, int index)
+    // Gives the family mesh its quads' vertex layout, four quads long. Every
+    // attribute must be Float32 so quads can be copied as floats.
+    static bool CreateMesh(Shell shell, VertexAttributeDescriptor[] attributes, int count)
     {
-        var child = group.children[index];
-        var source = child.mesh;
-        int vertexCount = VertsPerQuad;
-        if (source.vertexCount != vertexCount || source.subMeshCount != 1)
+        System.Array.Clear(shell.strides, 0, shell.strides.Length);
+        bool hasPosition = false;
+        for (int i = 0; i < count; ++i)
+        {
+            var descriptor = attributes[i];
+            if (descriptor.format != VertexAttributeFormat.Float32 || descriptor.stream >= 4)
+                return false;
+
+            hasPosition |= descriptor.attribute == VertexAttribute.Position;
+            // Attributes are laid out in a stream in the order given.
+            shell.offsets[(int)descriptor.attribute] = shell.strides[descriptor.stream];
+            shell.strides[descriptor.stream] += descriptor.dimension;
+        }
+        if (!hasPosition)
             return false;
 
-        int layout = group.layout;
-        if (Layout(source) != layout)
-            return false;
+        shell.attributes = new VertexAttributeDescriptor[count];
+        System.Array.Copy(attributes, shell.attributes, count);
 
-        var mesh = group.mesh;
-        int baseVertex = index * vertexCount;
-        Vector3 position = child.positionPlanet;
-        Vector3 origin = group.parent.positionPlanet;
-        var offset = position - origin;
-
-        source.GetVertices(Vector3Scratch);
-        for (int i = 0; i < vertexCount; ++i)
-            Vector3Scratch[i] += offset;
-        mesh.SetVertexBufferData(Vector3Scratch, 0, baseVertex, vertexCount, 0, UpdateFlags);
-
-        source.GetNormals(Vector3Scratch);
-        mesh.SetVertexBufferData(Vector3Scratch, 0, baseVertex, vertexCount, 1, UpdateFlags);
-
-        int stream = 2;
-        if (HasTangents(layout))
-        {
-            source.GetTangents(Vector4Scratch);
-            mesh.SetVertexBufferData(Vector4Scratch, 0, baseVertex, vertexCount, 2, UpdateFlags);
-            stream = 3;
-        }
-
-        int stride = InterleavedStride(layout);
-        if (stride != 0)
-        {
-            CopyInterleaved(source, layout, stride, vertexCount);
-            mesh.SetVertexBufferData(
-                InterleavedScratch,
-                0,
-                baseVertex * stride,
-                vertexCount * stride,
-                stream,
-                UpdateFlags
-            );
-        }
-
-        int indexCount = IndicesPerQuad;
-        source.GetIndices(IndexScratch, 0);
-        if (IndexScratch.Count > indexCount)
-            return false;
-        if (IndexSlice.Length != indexCount)
-            IndexSlice = new ushort[indexCount];
-        for (int i = 0; i < IndexScratch.Count; ++i)
-            IndexSlice[i] = (ushort)(IndexScratch[i] + baseVertex);
-        // Pad with degenerate triangles.
-        for (int i = IndexScratch.Count; i < indexCount; ++i)
-            IndexSlice[i] = (ushort)baseVertex;
-        mesh.SetIndexBufferData(IndexSlice, 0, index * indexCount, indexCount, UpdateFlags);
-
-        var bounds = source.bounds;
-        bounds.center += offset;
-        group.bounds[index] = bounds;
-        return true;
-    }
-
-    // Packs whether the mesh has tangents and colors, and each UV channel's
-    // dimension. Positions and normals are required.
-    static int Layout(Mesh mesh)
-    {
-        if (
-            !mesh.HasVertexAttribute(VertexAttribute.Position)
-            || !mesh.HasVertexAttribute(VertexAttribute.Normal)
-        )
-            return -1;
-
-        int layout = 0;
-        if (mesh.HasVertexAttribute(VertexAttribute.Tangent))
-            layout |= 1;
-        if (mesh.HasVertexAttribute(VertexAttribute.Color))
-            layout |= 2;
-        for (int channel = 0; channel < 4; ++channel)
-            layout |= UvDimension(mesh, channel) << (2 + 3 * channel);
-        return layout;
-    }
-
-    static bool HasTangents(int layout) => (layout & 1) != 0;
-
-    static bool HasColors(int layout) => (layout & 2) != 0;
-
-    static int UvDimension(int layout, int channel) => (layout >> (2 + 3 * channel)) & 7;
-
-    static int UvDimension(Mesh mesh, int channel)
-    {
-        var attribute = VertexAttribute.TexCoord0 + channel;
-        return mesh.HasVertexAttribute(attribute) ? mesh.GetVertexAttributeDimension(attribute) : 0;
-    }
-
-    // Floats per vertex in the stream holding colors and UVs.
-    static int InterleavedStride(int layout)
-    {
-        int stride = HasColors(layout) ? 4 : 0;
-        for (int channel = 0; channel < 4; ++channel)
-            stride += UvDimension(layout, channel);
-        return stride;
-    }
-
-    // Positions, normals and tangents each get their own stream so a child can
-    // be written in place. Colors and UVs share the last one.
-    static void CreateMesh(Mesh mesh, int layout)
-    {
-        Attributes.Clear();
-        Attributes.Add(new(VertexAttribute.Position, VertexAttributeFormat.Float32, 3, 0));
-        Attributes.Add(new(VertexAttribute.Normal, VertexAttributeFormat.Float32, 3, 1));
-
-        int stream = 2;
-        if (HasTangents(layout))
-        {
-            Attributes.Add(new(VertexAttribute.Tangent, VertexAttributeFormat.Float32, 4, 2));
-            stream = 3;
-        }
-        if (HasColors(layout))
-            Attributes.Add(new(VertexAttribute.Color, VertexAttributeFormat.Float32, 4, stream));
-        for (int channel = 0; channel < 4; ++channel)
-        {
-            int dimension = UvDimension(layout, channel);
-            if (dimension != 0)
-                Attributes.Add(
-                    new(
-                        VertexAttribute.TexCoord0 + channel,
-                        VertexAttributeFormat.Float32,
-                        dimension,
-                        stream
-                    )
-                );
-        }
-
+        var mesh = shell.mesh;
         mesh.Clear();
-        mesh.SetVertexBufferParams(4 * VertsPerQuad, Attributes.ToArray());
+        mesh.SetVertexBufferParams(4 * VertsPerQuad, shell.attributes);
         mesh.SetIndexBufferParams(4 * IndicesPerQuad, IndexFormat.UInt16);
         mesh.subMeshCount = 1;
+        return true;
     }
-
-    static void CopyInterleaved(Mesh source, int layout, int stride, int vertexCount)
-    {
-        if (InterleavedScratch.Length < stride * vertexCount)
-            InterleavedScratch = new float[stride * vertexCount];
-
-        int offset = 0;
-        if (HasColors(layout))
-        {
-            source.GetColors(ColorScratch);
-            for (int i = 0; i < vertexCount; ++i)
-            {
-                var color = ColorScratch[i];
-                int at = i * stride;
-                InterleavedScratch[at] = color.r;
-                InterleavedScratch[at + 1] = color.g;
-                InterleavedScratch[at + 2] = color.b;
-                InterleavedScratch[at + 3] = color.a;
-            }
-            offset = 4;
-        }
-
-        for (int channel = 0; channel < 4; ++channel)
-        {
-            int dimension = UvDimension(layout, channel);
-            if (dimension == 0)
-                continue;
-
-            if (dimension == 2)
-            {
-                source.GetUVs(channel, Vector2Scratch);
-                for (int i = 0; i < vertexCount; ++i)
-                {
-                    var uv = Vector2Scratch[i];
-                    int at = i * stride + offset;
-                    InterleavedScratch[at] = uv.x;
-                    InterleavedScratch[at + 1] = uv.y;
-                }
-            }
-            else
-            {
-                source.GetUVs(channel, Vector4Scratch);
-                for (int i = 0; i < vertexCount; ++i)
-                {
-                    var uv = Vector4Scratch[i];
-                    int at = i * stride + offset;
-                    for (int c = 0; c < dimension; ++c)
-                        InterleavedScratch[at + c] = uv[c];
-                }
-            }
-            offset += dimension;
-        }
-    }
+    #endregion
 }
