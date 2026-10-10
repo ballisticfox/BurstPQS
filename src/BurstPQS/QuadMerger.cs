@@ -3,6 +3,7 @@ using BurstPQS.Util;
 using Unity.Profiling;
 using UnityEngine;
 using UnityEngine.Rendering;
+using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace BurstPQS;
 
@@ -21,129 +22,259 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
 {
     internal static bool Enabled = true;
 
+    // Renderer checks cross into native code, so only this many families are
+    // checked each frame. PQ fields are checked for every family every frame.
+    const int ChecksPerFrame = 16;
+
+    // A family that failed the renderer checks is retried after this many frames.
+    const int RejectFrames = 60;
+
+    // Main thread time per frame for copying child meshes. Families still
+    // waiting draw their children until they are copied.
+    static readonly long CopyBudget = Stopwatch.Frequency / 4000;
+
+    // Accumulated cost, for profiling.
+    internal static long CheckTicks;
+    internal static long CopyTicks;
+    internal static int CopiedQuads;
+    internal static int Frames;
+
     static readonly ProfilerMarker ReconcileMarker = new("QuadMerger.Reconcile");
-    static readonly ProfilerMarker RebuildMarker = new("QuadMerger.Rebuild");
 
     sealed class Group
     {
         public PQ parent;
         public readonly PQ[] children = new PQ[4];
+        public readonly Bounds[] bounds = new Bounds[4];
         public GameObject gameObject;
         public MeshRenderer renderer;
         public Mesh mesh;
 
-        // Set when a child's mesh changes. Cleared by a rebuild.
-        public bool dirty = true;
+        // The vertex layout the mesh was created with, or -1.
+        public int layout = -1;
 
-        // False if the children could not be merged; they draw themselves
-        // until one of them changes again.
+        // Children whose part of the mesh is out of date.
+        public int stale = 0xF;
+
+        // Whether the merged mesh is drawn instead of the children.
         public bool merged;
+
+        // Set when a child could not be copied, until a child changes again.
+        public bool failed;
     }
 
     readonly Dictionary<PQ, Group> groups = [];
-    readonly List<PQ> removeScratch = [];
+    readonly List<Group> groupList = [];
+    readonly HashSet<PQ> rejected = [];
+    int frame;
+    int checkCursor;
+    int copyCursor;
 
     static readonly List<Material> MaterialsA = [];
     static readonly List<Material> MaterialsB = [];
-
-    static readonly List<Vector3> Positions = [];
-    static readonly List<Vector3> Normals = [];
-    static readonly List<Vector4> Tangents = [];
-    static readonly List<Color> Colors = [];
-    static readonly List<Vector2>[] Uv2s =
-    [
-        [],
-        [],
-        [],
-        [],
-    ];
-    static readonly List<Vector4>[] Uv4s =
-    [
-        [],
-        [],
-        [],
-        [],
-    ];
-    static readonly List<int> Indices = [];
-
+    static readonly List<VertexAttributeDescriptor> Attributes = [];
+    static readonly List<Vector2> Vector2Scratch = [];
     static readonly List<Vector3> Vector3Scratch = [];
     static readonly List<Vector4> Vector4Scratch = [];
     static readonly List<Color> ColorScratch = [];
-    static readonly List<Vector2> Vector2Scratch = [];
     static readonly List<int> IndexScratch = [];
-    static readonly int[] UvDimensions = new int[4];
+    static float[] InterleavedScratch = [];
+    static ushort[] IndexSlice = [];
 
-    // A child of this quad's mesh changed, so its family must be rebuilt.
+    const MeshUpdateFlags UpdateFlags =
+        MeshUpdateFlags.DontValidateIndices
+        | MeshUpdateFlags.DontRecalculateBounds
+        | MeshUpdateFlags.DontResetBoneBounds;
+
+    static int VertsPerQuad => PQS.cacheVertCount;
+    static int IndicesPerQuad => PQS.cacheIndices[0].Length;
+
+    // A quad's mesh changed, so its part of the family mesh must be copied again.
     internal void MarkDirty(PQ quad)
     {
         var parent = quad.parent;
-        if (parent is not null && groups.TryGetValue(parent, out var group))
-            group.dirty = true;
+        if (parent is null || !groups.TryGetValue(parent, out var group))
+            return;
+
+        for (int i = 0; i < 4; ++i)
+        {
+            if (ReferenceEquals(group.children[i], quad))
+            {
+                group.stale |= 1 << i;
+                group.failed = false;
+            }
+        }
     }
 
     // Runs once a frame, after the quad tree has been updated.
     internal void Reconcile(List<PQ> activeQuads)
     {
-        bool canMerge = Enabled && batchPQS.CanMergeQuads;
-        if (!canMerge && groups.Count == 0)
+        if (!Enabled || !batchPQS.CanMergeQuads)
+        {
+            if (groupList.Count != 0)
+                Clear();
             return;
+        }
 
         using var scope = ReconcileMarker.Auto();
+        long start = Stopwatch.GetTimestamp();
 
-        foreach (var pair in groups)
+        frame++;
+        Frames++;
+        if (frame % RejectFrames == 0)
+            rejected.Clear();
+
+        for (int i = groupList.Count - 1; i >= 0; --i)
         {
-            if (!canMerge || !IsSameFamily(pair.Key, pair.Value) || !IsComplete(pair.Key))
-                removeScratch.Add(pair.Key);
+            if (!IsIntact(groupList[i]))
+                RemoveAt(i);
         }
 
-        foreach (var parent in removeScratch)
+        int checks = Mathf.Min(ChecksPerFrame, groupList.Count);
+        for (int n = 0; n < checks && groupList.Count != 0; ++n)
         {
-            Dissolve(groups[parent]);
-            groups.Remove(parent);
+            checkCursor %= groupList.Count;
+            var group = groupList[checkCursor];
+            if (DrawsAlike(group.parent))
+            {
+                if (group.merged)
+                    SyncRenderer(group);
+                checkCursor++;
+            }
+            else
+            {
+                rejected.Add(group.parent);
+                RemoveAt(checkCursor);
+            }
         }
-        removeScratch.Clear();
-
-        if (!canMerge)
-            return;
 
         foreach (var quad in activeQuads)
         {
             if (
-                quad.IsNotNullOrDestroyed()
-                && quad.isSubdivided
-                && !groups.ContainsKey(quad)
-                && IsComplete(quad)
+                quad.IsNullOrDestroyed()
+                || !quad.isSubdivided
+                || groups.ContainsKey(quad)
+                || !IsFamily(quad)
+                || rejected.Contains(quad)
             )
-                groups.Add(quad, Create(quad));
+                continue;
+
+            if (DrawsAlike(quad))
+                Add(quad);
+            else
+                rejected.Add(quad);
         }
 
-        foreach (var group in groups.Values)
+        long copyStart = Stopwatch.GetTimestamp();
+        CheckTicks += copyStart - start;
+
+        long deadline = copyStart + CopyBudget;
+        int count = groupList.Count;
+        for (int n = 0; n < count; ++n)
         {
-            if (group.dirty)
+            var group = groupList[(copyCursor + n) % count];
+            if (group.stale == 0 || group.failed)
+                continue;
+
+            if (Stopwatch.GetTimestamp() > deadline)
             {
-                group.dirty = false;
-                group.merged = Rebuild(group);
+                SetMerged(group, false);
+                continue;
             }
 
-            if (group.merged)
-                SyncRenderer(group);
-            SetMerged(group, group.merged);
+            if (!Copy(group))
+            {
+                group.failed = true;
+                SetMerged(group, false);
+                continue;
+            }
+
+            SyncRenderer(group);
+            SetMerged(group, true);
         }
+        if (count != 0)
+            copyCursor = (copyCursor + 1) % count;
+
+        CopyTicks += Stopwatch.GetTimestamp() - copyStart;
     }
 
     internal void Clear()
     {
-        foreach (var group in groups.Values)
+        foreach (var group in groupList)
             Dissolve(group);
+        groupList.Clear();
         groups.Clear();
     }
 
-    static bool IsSameFamily(PQ parent, Group group)
+    void Add(PQ parent)
     {
-        if (parent.IsNullOrDestroyed())
+        var gameObject = new GameObject("QuadGroup");
+        gameObject.layer = parent.subNodes[0].gameObject.layer;
+        gameObject.transform.SetParent(parent.transform, false);
+
+        var mesh = new Mesh { name = "QuadGroup" };
+        mesh.MarkDynamic();
+        gameObject.AddComponent<MeshFilter>().sharedMesh = mesh;
+
+        var group = new Group
+        {
+            parent = parent,
+            gameObject = gameObject,
+            renderer = gameObject.AddComponent<MeshRenderer>(),
+            mesh = mesh,
+        };
+        group.renderer.enabled = false;
+        for (int i = 0; i < 4; ++i)
+            group.children[i] = parent.subNodes[i];
+
+        groups.Add(parent, group);
+        groupList.Add(group);
+    }
+
+    void RemoveAt(int index)
+    {
+        var group = groupList[index];
+        Dissolve(group);
+        groups.Remove(group.parent);
+
+        int last = groupList.Count - 1;
+        groupList[index] = groupList[last];
+        groupList.RemoveAt(last);
+    }
+
+    static void Dissolve(Group group)
+    {
+        SetMerged(group, false);
+        if (group.gameObject.IsNotNullOrDestroyed())
+            Object.Destroy(group.gameObject);
+        if (group.mesh.IsNotNullOrDestroyed())
+            Object.Destroy(group.mesh);
+    }
+
+    static void SetMerged(Group group, bool merged)
+    {
+        if (group.merged == merged)
+            return;
+        group.merged = merged;
+
+        if (group.renderer.IsNotNullOrDestroyed())
+            group.renderer.enabled = merged;
+
+        foreach (var child in group.children)
+        {
+            if (child.IsNotNullOrDestroyed() && child.meshRenderer.IsNotNullOrDestroyed())
+                child.meshRenderer.forceRenderingOff = merged;
+        }
+    }
+
+    // Whether this group's quads are still the visible children of its parent.
+    // Only reads PQ fields, so it is cheap enough to run on every group.
+    static bool IsIntact(Group group)
+    {
+        if (!IsFamily(group.parent))
             return false;
 
-        var subNodes = parent.subNodes;
+        var subNodes = group.parent.subNodes;
         for (int i = 0; i < 4; ++i)
         {
             if (!ReferenceEquals(subNodes[i], group.children[i]))
@@ -152,15 +283,14 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         return true;
     }
 
-    // Whether all four children of this quad draw, and draw the same way.
-    static bool IsComplete(PQ parent)
+    // Whether all four children of this quad are visible leaves.
+    static bool IsFamily(PQ parent)
     {
         if (
             parent.IsNullOrDestroyed()
             || !parent.isSubdivided
             || !parent.isActive
             || parent.quadRoot is null
-            || !parent.gameObject.activeInHierarchy
         )
             return false;
 
@@ -168,32 +298,48 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         if (subNodes is null || subNodes.Length != 4)
             return false;
 
-        var first = subNodes[0];
-        for (int i = 0; i < 4; ++i)
+        foreach (var child in subNodes)
         {
-            if (!IsDrawnLeaf(subNodes[i]))
-                return false;
-            if (i != 0 && !DrawsSame(first.meshRenderer, subNodes[i].meshRenderer))
+            if (
+                child.IsNullOrDestroyed()
+                || !child.isActive
+                || !child.isBuilt
+                || child.isSubdivided
+                || !child.isVisible
+                || child.isForcedInvisible
+            )
                 return false;
         }
         return true;
     }
 
-    static bool IsDrawnLeaf(PQ quad) =>
-        quad.IsNotNullOrDestroyed()
-        && quad.isActive
-        && quad.isBuilt
-        && !quad.isSubdivided
-        && quad.isVisible
-        && !quad.isForcedInvisible
-        && quad.meshRenderer.IsNotNullOrDestroyed()
-        && quad.meshRenderer.enabled
-        && quad.gameObject.activeInHierarchy
-        // Parallax swaps in its own mesh near the camera.
-        && quad.meshFilter.IsNotNullOrDestroyed()
-        && ReferenceEquals(quad.meshFilter.sharedMesh, quad.mesh);
+    // Whether all four children render, and render the same way.
+    static bool DrawsAlike(PQ parent)
+    {
+        if (!parent.gameObject.activeInHierarchy)
+            return false;
 
-    static bool DrawsSame(Renderer a, Renderer b) =>
+        var first = parent.subNodes[0].meshRenderer;
+        foreach (var child in parent.subNodes)
+        {
+            var renderer = child.meshRenderer;
+            if (
+                renderer.IsNullOrDestroyed()
+                || !renderer.enabled
+                || !child.gameObject.activeInHierarchy
+                // Parallax swaps in its own mesh near the camera.
+                || child.meshFilter.IsNullOrDestroyed()
+                || !ReferenceEquals(child.meshFilter.sharedMesh, child.mesh)
+            )
+                return false;
+
+            if (!ReferenceEquals(renderer, first) && !RendersSame(first, renderer))
+                return false;
+        }
+        return true;
+    }
+
+    static bool RendersSame(Renderer a, Renderer b) =>
         a.gameObject.layer == b.gameObject.layer
         && a.shadowCastingMode == b.shadowCastingMode
         && a.receiveShadows == b.receiveShadows
@@ -215,52 +361,6 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
                 return false;
         }
         return true;
-    }
-
-    static Group Create(PQ parent)
-    {
-        var gameObject = new GameObject("QuadGroup");
-        gameObject.layer = parent.subNodes[0].gameObject.layer;
-        gameObject.transform.SetParent(parent.transform, false);
-
-        var mesh = new Mesh { name = "QuadGroup" };
-        mesh.MarkDynamic();
-        gameObject.AddComponent<MeshFilter>().sharedMesh = mesh;
-
-        var group = new Group
-        {
-            parent = parent,
-            gameObject = gameObject,
-            renderer = gameObject.AddComponent<MeshRenderer>(),
-            mesh = mesh,
-        };
-        group.renderer.enabled = false;
-        for (int i = 0; i < 4; ++i)
-            group.children[i] = parent.subNodes[i];
-        return group;
-    }
-
-    static void Dissolve(Group group)
-    {
-        SetMerged(group, false);
-        if (group.gameObject.IsNotNullOrDestroyed())
-            Object.Destroy(group.gameObject);
-        if (group.mesh.IsNotNullOrDestroyed())
-            Object.Destroy(group.mesh);
-    }
-
-    static void SetMerged(Group group, bool merged)
-    {
-        if (group.renderer.IsNotNullOrDestroyed() && group.renderer.enabled != merged)
-            group.renderer.enabled = merged;
-
-        foreach (var child in group.children)
-        {
-            if (child.IsNullOrDestroyed() || child.meshRenderer.IsNullOrDestroyed())
-                continue;
-            if (child.meshRenderer.forceRenderingOff != merged)
-                child.meshRenderer.forceRenderingOff = merged;
-        }
     }
 
     static void SyncRenderer(Group group)
@@ -286,137 +386,247 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
             group.gameObject.layer = layer;
     }
 
-    // Copies the four child meshes into the group mesh. Every child's vertices
-    // are relative to its own (float) planet position and quads don't rotate
-    // or scale relative to each other, so merging is a translation per child.
-    static bool Rebuild(Group group)
+    // Copies each stale child into its part of the family mesh. Every child's
+    // vertices are relative to its own (float) planet position and quads don't
+    // rotate or scale relative to each other, so a child is copied with a
+    // translation.
+    static bool Copy(Group group)
     {
-        using var scope = RebuildMarker.Auto();
-
-        var first = group.children[0].mesh;
-        int vertexCount = first.vertexCount;
-        bool hasNormals = first.HasVertexAttribute(VertexAttribute.Normal);
-        bool hasTangents = first.HasVertexAttribute(VertexAttribute.Tangent);
-        bool hasColors = first.HasVertexAttribute(VertexAttribute.Color);
-        var uvDimensions = UvDimensions;
-        for (int channel = 0; channel < 4; ++channel)
-            uvDimensions[channel] = UvDimension(first, channel);
-
-        Positions.Clear();
-        Normals.Clear();
-        Tangents.Clear();
-        Colors.Clear();
-        Indices.Clear();
-        for (int channel = 0; channel < 4; ++channel)
+        // Creating the mesh for a new layout clears it, so every child is copied again.
+        int layout = Layout(group.children[0].mesh);
+        if (layout < 0)
+            return false;
+        if (layout != group.layout)
         {
-            Uv2s[channel].Clear();
-            Uv4s[channel].Clear();
+            CreateMesh(group.mesh, layout);
+            group.layout = layout;
+            group.stale = 0xF;
         }
-
-        Vector3 origin = group.parent.positionPlanet;
-        Bounds bounds = default;
 
         for (int i = 0; i < 4; ++i)
         {
-            var child = group.children[i];
-            var mesh = child.mesh;
-            if (
-                mesh.vertexCount != vertexCount
-                || mesh.subMeshCount != 1
-                || mesh.HasVertexAttribute(VertexAttribute.Normal) != hasNormals
-                || mesh.HasVertexAttribute(VertexAttribute.Tangent) != hasTangents
-                || mesh.HasVertexAttribute(VertexAttribute.Color) != hasColors
-            )
+            if ((group.stale & (1 << i)) == 0)
+                continue;
+
+            if (!CopyChild(group, i))
                 return false;
-            for (int channel = 0; channel < 4; ++channel)
-            {
-                if (UvDimension(mesh, channel) != uvDimensions[channel])
-                    return false;
-            }
 
-            Vector3 position = child.positionPlanet;
-            var offset = position - origin;
-            int baseVertex = Positions.Count;
-
-            mesh.GetVertices(Vector3Scratch);
-            foreach (var vertex in Vector3Scratch)
-                Positions.Add(vertex + offset);
-
-            if (hasNormals)
-            {
-                mesh.GetNormals(Vector3Scratch);
-                Normals.AddRange(Vector3Scratch);
-            }
-            if (hasTangents)
-            {
-                mesh.GetTangents(Vector4Scratch);
-                Tangents.AddRange(Vector4Scratch);
-            }
-            if (hasColors)
-            {
-                mesh.GetColors(ColorScratch);
-                Colors.AddRange(ColorScratch);
-            }
-            for (int channel = 0; channel < 4; ++channel)
-            {
-                switch (uvDimensions[channel])
-                {
-                    case 0:
-                        break;
-                    case 2:
-                        mesh.GetUVs(channel, Vector2Scratch);
-                        Uv2s[channel].AddRange(Vector2Scratch);
-                        break;
-                    default:
-                        mesh.GetUVs(channel, Vector4Scratch);
-                        Uv4s[channel].AddRange(Vector4Scratch);
-                        break;
-                }
-            }
-
-            mesh.GetIndices(IndexScratch, 0);
-            foreach (var index in IndexScratch)
-                Indices.Add(index + baseVertex);
-
-            var childBounds = mesh.bounds;
-            childBounds.center += offset;
-            if (i == 0)
-                bounds = childBounds;
-            else
-                bounds.Encapsulate(childBounds);
+            group.stale &= ~(1 << i);
+            CopiedQuads++;
         }
 
-        var merged = group.mesh;
-        merged.Clear();
-        merged.SetVertices(Positions);
-        if (hasNormals)
-            merged.SetNormals(Normals);
-        if (hasTangents)
-            merged.SetTangents(Tangents);
-        if (hasColors)
-            merged.SetColors(Colors);
-        for (int channel = 0; channel < 4; ++channel)
-        {
-            switch (uvDimensions[channel])
+        var bounds = group.bounds[0];
+        for (int i = 1; i < 4; ++i)
+            bounds.Encapsulate(group.bounds[i]);
+
+        group.mesh.SetSubMesh(
+            0,
+            new SubMeshDescriptor(0, 4 * IndicesPerQuad)
             {
-                case 0:
-                    break;
-                case 2:
-                    merged.SetUVs(channel, Uv2s[channel]);
-                    break;
-                default:
-                    merged.SetUVs(channel, Uv4s[channel]);
-                    break;
-            }
-        }
-        merged.SetIndices(Indices, MeshTopology.Triangles, 0, false);
-        merged.bounds = bounds;
+                bounds = bounds,
+                firstVertex = 0,
+                vertexCount = 4 * VertsPerQuad,
+            },
+            UpdateFlags
+        );
+        group.mesh.bounds = bounds;
         return true;
     }
+
+    static bool CopyChild(Group group, int index)
+    {
+        var child = group.children[index];
+        var source = child.mesh;
+        int vertexCount = VertsPerQuad;
+        if (source.vertexCount != vertexCount || source.subMeshCount != 1)
+            return false;
+
+        int layout = group.layout;
+        if (Layout(source) != layout)
+            return false;
+
+        var mesh = group.mesh;
+        int baseVertex = index * vertexCount;
+        Vector3 position = child.positionPlanet;
+        Vector3 origin = group.parent.positionPlanet;
+        var offset = position - origin;
+
+        source.GetVertices(Vector3Scratch);
+        for (int i = 0; i < vertexCount; ++i)
+            Vector3Scratch[i] += offset;
+        mesh.SetVertexBufferData(Vector3Scratch, 0, baseVertex, vertexCount, 0, UpdateFlags);
+
+        source.GetNormals(Vector3Scratch);
+        mesh.SetVertexBufferData(Vector3Scratch, 0, baseVertex, vertexCount, 1, UpdateFlags);
+
+        int stream = 2;
+        if (HasTangents(layout))
+        {
+            source.GetTangents(Vector4Scratch);
+            mesh.SetVertexBufferData(Vector4Scratch, 0, baseVertex, vertexCount, 2, UpdateFlags);
+            stream = 3;
+        }
+
+        int stride = InterleavedStride(layout);
+        if (stride != 0)
+        {
+            CopyInterleaved(source, layout, stride, vertexCount);
+            mesh.SetVertexBufferData(
+                InterleavedScratch,
+                0,
+                baseVertex * stride,
+                vertexCount * stride,
+                stream,
+                UpdateFlags
+            );
+        }
+
+        int indexCount = IndicesPerQuad;
+        source.GetIndices(IndexScratch, 0);
+        if (IndexScratch.Count > indexCount)
+            return false;
+        if (IndexSlice.Length != indexCount)
+            IndexSlice = new ushort[indexCount];
+        for (int i = 0; i < IndexScratch.Count; ++i)
+            IndexSlice[i] = (ushort)(IndexScratch[i] + baseVertex);
+        // Pad with degenerate triangles.
+        for (int i = IndexScratch.Count; i < indexCount; ++i)
+            IndexSlice[i] = (ushort)baseVertex;
+        mesh.SetIndexBufferData(IndexSlice, 0, index * indexCount, indexCount, UpdateFlags);
+
+        var bounds = source.bounds;
+        bounds.center += offset;
+        group.bounds[index] = bounds;
+        return true;
+    }
+
+    // Packs whether the mesh has tangents and colors, and each UV channel's
+    // dimension. Positions and normals are required.
+    static int Layout(Mesh mesh)
+    {
+        if (
+            !mesh.HasVertexAttribute(VertexAttribute.Position)
+            || !mesh.HasVertexAttribute(VertexAttribute.Normal)
+        )
+            return -1;
+
+        int layout = 0;
+        if (mesh.HasVertexAttribute(VertexAttribute.Tangent))
+            layout |= 1;
+        if (mesh.HasVertexAttribute(VertexAttribute.Color))
+            layout |= 2;
+        for (int channel = 0; channel < 4; ++channel)
+            layout |= UvDimension(mesh, channel) << (2 + 3 * channel);
+        return layout;
+    }
+
+    static bool HasTangents(int layout) => (layout & 1) != 0;
+
+    static bool HasColors(int layout) => (layout & 2) != 0;
+
+    static int UvDimension(int layout, int channel) => (layout >> (2 + 3 * channel)) & 7;
 
     static int UvDimension(Mesh mesh, int channel)
     {
         var attribute = VertexAttribute.TexCoord0 + channel;
         return mesh.HasVertexAttribute(attribute) ? mesh.GetVertexAttributeDimension(attribute) : 0;
+    }
+
+    // Floats per vertex in the stream holding colors and UVs.
+    static int InterleavedStride(int layout)
+    {
+        int stride = HasColors(layout) ? 4 : 0;
+        for (int channel = 0; channel < 4; ++channel)
+            stride += UvDimension(layout, channel);
+        return stride;
+    }
+
+    // Positions, normals and tangents each get their own stream so a child can
+    // be written in place. Colors and UVs share the last one.
+    static void CreateMesh(Mesh mesh, int layout)
+    {
+        Attributes.Clear();
+        Attributes.Add(new(VertexAttribute.Position, VertexAttributeFormat.Float32, 3, 0));
+        Attributes.Add(new(VertexAttribute.Normal, VertexAttributeFormat.Float32, 3, 1));
+
+        int stream = 2;
+        if (HasTangents(layout))
+        {
+            Attributes.Add(new(VertexAttribute.Tangent, VertexAttributeFormat.Float32, 4, 2));
+            stream = 3;
+        }
+        if (HasColors(layout))
+            Attributes.Add(new(VertexAttribute.Color, VertexAttributeFormat.Float32, 4, stream));
+        for (int channel = 0; channel < 4; ++channel)
+        {
+            int dimension = UvDimension(layout, channel);
+            if (dimension != 0)
+                Attributes.Add(
+                    new(
+                        VertexAttribute.TexCoord0 + channel,
+                        VertexAttributeFormat.Float32,
+                        dimension,
+                        stream
+                    )
+                );
+        }
+
+        mesh.Clear();
+        mesh.SetVertexBufferParams(4 * VertsPerQuad, Attributes.ToArray());
+        mesh.SetIndexBufferParams(4 * IndicesPerQuad, IndexFormat.UInt16);
+        mesh.subMeshCount = 1;
+    }
+
+    static void CopyInterleaved(Mesh source, int layout, int stride, int vertexCount)
+    {
+        if (InterleavedScratch.Length < stride * vertexCount)
+            InterleavedScratch = new float[stride * vertexCount];
+
+        int offset = 0;
+        if (HasColors(layout))
+        {
+            source.GetColors(ColorScratch);
+            for (int i = 0; i < vertexCount; ++i)
+            {
+                var color = ColorScratch[i];
+                int at = i * stride;
+                InterleavedScratch[at] = color.r;
+                InterleavedScratch[at + 1] = color.g;
+                InterleavedScratch[at + 2] = color.b;
+                InterleavedScratch[at + 3] = color.a;
+            }
+            offset = 4;
+        }
+
+        for (int channel = 0; channel < 4; ++channel)
+        {
+            int dimension = UvDimension(layout, channel);
+            if (dimension == 0)
+                continue;
+
+            if (dimension == 2)
+            {
+                source.GetUVs(channel, Vector2Scratch);
+                for (int i = 0; i < vertexCount; ++i)
+                {
+                    var uv = Vector2Scratch[i];
+                    int at = i * stride + offset;
+                    InterleavedScratch[at] = uv.x;
+                    InterleavedScratch[at + 1] = uv.y;
+                }
+            }
+            else
+            {
+                source.GetUVs(channel, Vector4Scratch);
+                for (int i = 0; i < vertexCount; ++i)
+                {
+                    var uv = Vector4Scratch[i];
+                    int at = i * stride + offset;
+                    for (int c = 0; c < dimension; ++c)
+                        InterleavedScratch[at + c] = uv[c];
+                }
+            }
+            offset += dimension;
+        }
     }
 }
