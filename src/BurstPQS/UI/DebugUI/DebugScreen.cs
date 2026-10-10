@@ -64,6 +64,7 @@ internal class BurstDebugScreenContent : MonoBehaviour
     const string LabelBurst = "BurstPQS";
     const string LabelFallback = "Fallback";
     const string LabelForceFallback = "Force Fallback Mode";
+    const string LabelMergeQuads = "Merge Quad Draws";
     const string TooltipBurstCompilation = """
         Whether burst compilation is working correctly.
 
@@ -86,6 +87,12 @@ internal class BurstDebugScreenContent : MonoBehaviour
         This is mainly useful for comparing the implementation of PQSMods
         between BurstPQS and stock. If you're not doing that then you can ignore
         this option.
+        """;
+    const string TooltipMergeQuads = """
+        Draw each group of four sibling terrain quads as a single mesh.
+
+        This cuts the number of terrain draw calls by up to 4x. Turn it off to
+        compare against drawing every quad separately.
         """;
     const string TooltipPlanets = """
         Shows whether BurstPQS is enabled for each planetary body.
@@ -182,6 +189,11 @@ internal class BurstDebugScreenContent : MonoBehaviour
         toggleRow.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = false;
         DebugUIManager.CreateToggle<ForceFallbackToggle>(toggleRow.transform, LabelForceFallback);
         DebugUIManager.CreateHelpButton(toggleRow.transform, TooltipForceFallback);
+
+        var mergeRow = DebugUIManager.CreateHorizontalLayout(parent);
+        mergeRow.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = false;
+        DebugUIManager.CreateToggle<MergeQuadsToggle>(mergeRow.transform, LabelMergeQuads);
+        DebugUIManager.CreateHelpButton(mergeRow.transform, TooltipMergeQuads);
     }
 
     private void BuildPlanetsSection(Transform parent)
@@ -352,6 +364,19 @@ internal class ForceFallbackToggle : DebugScreenToggle
     {
         BatchPQS.ForceFallback = state;
         GetComponentInParent<BurstDebugScreenContent>()?.RefreshPlanetTable();
+    }
+}
+
+internal class MergeQuadsToggle : DebugScreenToggle
+{
+    public override void SetupValues()
+    {
+        SetToggle(QuadMerger.Enabled);
+    }
+
+    public override void OnToggleChanged(bool state)
+    {
+        QuadMerger.Enabled = state;
     }
 }
 

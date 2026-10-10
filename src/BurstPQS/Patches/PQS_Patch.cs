@@ -153,6 +153,7 @@ internal static class PQS_BuildTangents_Patch
 
     static unsafe bool Prefix(PQ quad)
     {
+        BatchPQS.OnQuadMeshChanged(quad);
         BuildTangentsFunc ??= BurstUtil.MaybeCompileDelegate<BuildTangentsDelegate>(BuildTangents);
 
         Vector3[] normals;

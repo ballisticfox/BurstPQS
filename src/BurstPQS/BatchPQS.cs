@@ -38,6 +38,7 @@ public class BatchPQS : MonoBehaviour
     private readonly Dictionary<PQ, PendingBuild> pending = [];
     private readonly Queue<PQ> buildQueue = [];
     private NativeList<MeshDataStruct> disposeList;
+    private QuadMerger merger;
 
     // Patches look this up very often, and usually for the same PQS repeatedly,
     // so remember the last one.
@@ -70,11 +71,15 @@ public class BatchPQS : MonoBehaviour
         storageTransforms = new TransformAccessArray(64);
         storagePlanetPositions = new NativeList<double3>(64, Allocator.Persistent);
         snapshots = new NativeList<QuadSnapshot>(2048, Allocator.Persistent);
+        merger = new(this);
     }
+
+    void LateUpdate() => merger.Reconcile(activeQuads);
 
     void OnDestroy()
     {
         QuadColliderBaker.CompleteBake();
+        merger.Clear();
         storageHandle.Complete();
         storageTransforms.Dispose();
         storagePlanetPositions.Dispose();
@@ -216,6 +221,15 @@ public class BatchPQS : MonoBehaviour
     private JobHandle storageHandle;
 
     bool ManagesQuadPlacement => !Fallback && pqs.surfaceRelativeQuads && body != null;
+
+    // Merging relies on quads being placed by PlaceQuad.
+    internal bool CanMergeQuads => ManagesQuadPlacement && pqs.isActive;
+
+    // Called whenever a quad's mesh data changes.
+    internal static void OnQuadMeshChanged(PQ quad)
+    {
+        Get(quad.sphereRoot)?.merger.MarkDirty(quad);
+    }
 
     internal void UpdateLocalStorage()
     {
@@ -571,9 +585,10 @@ public class BatchPQS : MonoBehaviour
     }
 
     // Replaces mesh.triangles in PQ.UpdateVisibility.
-    internal static void SetQuadTriangles(Mesh mesh, int[] indices)
+    internal static void SetQuadTriangles(Mesh mesh, int[] indices, PQ quad)
     {
         QuadColliderBaker.CompleteBake();
+        OnQuadMeshChanged(quad);
         int vertexCount = mesh.vertexCount;
         if (vertexCount != PQS.cacheVertCount)
         {
@@ -614,6 +629,7 @@ public class BatchPQS : MonoBehaviour
 
     internal static void BeginQuadStreamUpdates(PQ quad)
     {
+        OnQuadMeshChanged(quad);
         edgeNormalsQuad = quad;
         layoutMesh = null;
     }
@@ -1568,6 +1584,7 @@ public class BatchPQS : MonoBehaviour
 
             // OnQuadBuilt mods may change fields used by the snapshot.
             batchPQS.InvalidateQuadSnapshot(quad);
+            batchPQS.merger.MarkDirty(quad);
         }
 
         public void Dispose()

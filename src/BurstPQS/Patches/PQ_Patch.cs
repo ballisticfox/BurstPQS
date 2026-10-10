@@ -128,14 +128,15 @@ internal static class PQ_UpdateVisibility_Patch
     {
         var setTriangles = AccessTools.PropertySetter(typeof(Mesh), nameof(Mesh.triangles));
         var replacement = SymbolExtensions.GetMethodInfo(() =>
-            BatchPQS.SetQuadTriangles(null, null)
+            BatchPQS.SetQuadTriangles(null, null, null)
         );
 
         var matcher = new CodeMatcher(instructions);
         matcher
             .MatchStartForward(new CodeMatch(OpCodes.Callvirt, setTriangles))
             .ThrowIfInvalid("Could not find call to Mesh.set_triangles in PQ.UpdateVisibility")
-            .SetInstruction(new CodeInstruction(OpCodes.Call, replacement));
+            .SetInstructionAndAdvance(new CodeInstruction(OpCodes.Ldarg_0))
+            .Insert(new CodeInstruction(OpCodes.Call, replacement));
 
         return matcher.Instructions();
     }
