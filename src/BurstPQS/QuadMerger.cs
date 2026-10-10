@@ -22,9 +22,10 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
 {
     internal static bool Enabled = true;
 
-    // Renderer checks cross into native code, so only this many families are
-    // rechecked each frame. PQ fields are checked for every family every frame.
-    const int ChecksPerFrame = 16;
+    // Families are checked when one of their quads changes. As a backstop for
+    // changes nothing reports (materials, renderers, meshes swapped by mods),
+    // this many families are also rechecked each frame.
+    const int ChecksPerFrame = 8;
 
     // A family that failed the renderer checks is retried after this many frames.
     const int RejectFrames = 60;
@@ -34,9 +35,8 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
     static readonly long CopyBudget = Stopwatch.Frequency / 4000;
 
     // Accumulated cost, for profiling.
-    internal static long IntactTicks;
     internal static long RecheckTicks;
-    internal static long ScanTicks;
+    internal static long ChangeTicks;
     internal static long CopyTicks;
     internal static int CopiedQuads;
     internal static int Frames;
@@ -64,14 +64,26 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
 
         // Set when a child could not be copied, until a child changes again.
         public bool failed;
+
+        // Whether the group is in copyQueue.
+        public bool queued;
+
+        // Set once dissolved. Destroy only takes effect at the end of the frame.
+        public bool removed;
+
+        // Position in groupList.
+        public int index;
     }
 
     readonly Dictionary<PQ, Group> groups = [];
     readonly List<Group> groupList = [];
     readonly HashSet<PQ> rejected = [];
+    readonly HashSet<PQ> changed = [];
+    readonly List<Group> copyQueue = [];
+    readonly List<Group> copyRequeue = [];
+    bool scanAll = true;
     int frame;
     int checkCursor;
-    int copyCursor;
 
     static readonly List<Material> MaterialsA = [];
     static readonly List<Material> MaterialsB = [];
@@ -105,8 +117,19 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
             {
                 group.stale |= 1 << i;
                 group.failed = false;
+                Queue(group);
             }
         }
+    }
+
+    // A quad was subdivided, collapsed, built or shown or hidden, which can
+    // make or break its own family and its parent's.
+    internal void MarkChanged(PQ quad)
+    {
+        changed.Add(quad);
+        var parent = quad.parent;
+        if (parent is not null)
+            changed.Add(parent);
     }
 
     // Runs once a frame, after the quad tree has been updated.
@@ -116,6 +139,8 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         {
             if (groupList.Count != 0)
                 Clear();
+            changed.Clear();
+            scanAll = true;
             return;
         }
 
@@ -129,16 +154,19 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
             Frames++;
         }
         if (frame % RejectFrames == 0)
-            rejected.Clear();
-
-        for (int i = groupList.Count - 1; i >= 0; --i)
         {
-            if (!IsIntact(groupList[i]))
-                RemoveAt(i);
+            changed.UnionWith(rejected);
+            rejected.Clear();
         }
-
-        long recheckStart = Stopwatch.GetTimestamp();
-        IntactTicks += recheckStart - start;
+        if (scanAll)
+        {
+            scanAll = false;
+            foreach (var quad in activeQuads)
+            {
+                if (quad.IsNotNullOrDestroyed() && quad.isSubdivided)
+                    changed.Add(quad);
+            }
+        }
 
         // A family that no longer matches is dissolved, and formed again below
         // if its children still render alike.
@@ -146,24 +174,30 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         for (int n = 0; n < checks && groupList.Count != 0; ++n)
         {
             checkCursor %= groupList.Count;
-            if (StillRendersAlike(groupList[checkCursor]))
+            var group = groupList[checkCursor];
+            if (IsIntact(group) && StillRendersAlike(group))
+            {
                 checkCursor++;
-            else
-                RemoveAt(checkCursor);
+                continue;
+            }
+
+            RemoveAt(checkCursor);
+            changed.Add(group.parent);
         }
 
-        long scanStart = Stopwatch.GetTimestamp();
-        RecheckTicks += scanStart - recheckStart;
+        long changeStart = Stopwatch.GetTimestamp();
+        RecheckTicks += changeStart - start;
 
-        foreach (var quad in activeQuads)
+        foreach (var quad in changed)
         {
-            if (
-                quad.IsNullOrDestroyed()
-                || !quad.isSubdivided
-                || groups.ContainsKey(quad)
-                || !IsFamily(quad)
-                || rejected.Contains(quad)
-            )
+            if (groups.TryGetValue(quad, out var group))
+            {
+                if (IsIntact(group) && StillRendersAlike(group))
+                    continue;
+                RemoveAt(group.index);
+            }
+
+            if (rejected.Contains(quad) || !IsFamily(quad))
                 continue;
 
             if (DrawsAlike(quad))
@@ -171,21 +205,22 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
             else
                 rejected.Add(quad);
         }
+        changed.Clear();
 
         long copyStart = Stopwatch.GetTimestamp();
-        ScanTicks += copyStart - scanStart;
+        ChangeTicks += copyStart - changeStart;
 
         long deadline = copyStart + CopyBudget;
-        int count = groupList.Count;
-        for (int n = 0; n < count; ++n)
+        foreach (var group in copyQueue)
         {
-            var group = groupList[(copyCursor + n) % count];
-            if (group.stale == 0 || group.failed)
+            group.queued = false;
+            if (group.stale == 0 || group.failed || group.removed)
                 continue;
 
             if (Stopwatch.GetTimestamp() > deadline)
             {
                 SetMerged(group, false);
+                copyRequeue.Add(group);
                 continue;
             }
 
@@ -198,10 +233,20 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
 
             SetMerged(group, true);
         }
-        if (count != 0)
-            copyCursor = (copyCursor + 1) % count;
+        copyQueue.Clear();
+        foreach (var group in copyRequeue)
+            Queue(group);
+        copyRequeue.Clear();
 
         CopyTicks += Stopwatch.GetTimestamp() - copyStart;
+    }
+
+    void Queue(Group group)
+    {
+        if (group.queued)
+            return;
+        group.queued = true;
+        copyQueue.Add(group);
     }
 
     internal void Clear()
@@ -210,6 +255,7 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
             Dissolve(group);
         groupList.Clear();
         groups.Clear();
+        copyQueue.Clear();
     }
 
     void Add(PQ parent)
@@ -234,8 +280,10 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
             group.children[i] = parent.subNodes[i];
         SyncRenderer(group);
 
+        group.index = groupList.Count;
         groups.Add(parent, group);
         groupList.Add(group);
+        Queue(group);
     }
 
     void RemoveAt(int index)
@@ -245,13 +293,16 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         groups.Remove(group.parent);
 
         int last = groupList.Count - 1;
-        groupList[index] = groupList[last];
+        var moved = groupList[last];
+        groupList[index] = moved;
+        moved.index = index;
         groupList.RemoveAt(last);
     }
 
     static void Dissolve(Group group)
     {
         SetMerged(group, false);
+        group.removed = true;
         if (group.gameObject.IsNotNullOrDestroyed())
             Object.Destroy(group.gameObject);
         if (group.mesh.IsNotNullOrDestroyed())

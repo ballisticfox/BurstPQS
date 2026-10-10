@@ -231,6 +231,12 @@ public class BatchPQS : MonoBehaviour
         Get(quad.sphereRoot)?.merger.MarkDirty(quad);
     }
 
+    // Called when a quad is subdivided, collapsed, shown or hidden.
+    internal static void OnQuadChanged(PQ quad)
+    {
+        Get(quad.sphereRoot)?.merger.MarkChanged(quad);
+    }
+
     internal void UpdateLocalStorage()
     {
         if (!ManagesQuadPlacement)
@@ -1585,6 +1591,7 @@ public class BatchPQS : MonoBehaviour
             // OnQuadBuilt mods may change fields used by the snapshot.
             batchPQS.InvalidateQuadSnapshot(quad);
             batchPQS.merger.MarkDirty(quad);
+            batchPQS.merger.MarkChanged(quad);
         }
 
         public void Dispose()
