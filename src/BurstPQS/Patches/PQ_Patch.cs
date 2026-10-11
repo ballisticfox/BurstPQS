@@ -60,7 +60,6 @@ internal static class PQ_Subdivide_Patch
 {
     static void Postfix(PQ __instance)
     {
-        BatchPQS.OnQuadChanged(__instance);
         if (!__instance.isSubdivided)
             return;
 
@@ -76,31 +75,6 @@ internal static class PQ_Subdivide_Patch
 
             batchPQS.PlaceQuad(child);
         }
-    }
-}
-
-// The quad merger tracks which quads are visible leaves.
-[HarmonyPatch(typeof(PQ), nameof(PQ.Collapse))]
-internal static class PQ_Collapse_Patch
-{
-    static void Postfix(PQ __instance) => BatchPQS.OnQuadChanged(__instance);
-}
-
-[HarmonyPatch]
-internal static class PQ_VisibilityChange_Patch
-{
-    static IEnumerable<MethodInfo> TargetMethods()
-    {
-        yield return SymbolExtensions.GetMethodInfo<PQ>(pq => pq.SetVisible());
-        yield return SymbolExtensions.GetMethodInfo<PQ>(pq => pq.SetInvisible());
-    }
-
-    static void Prefix(PQ __instance, out bool __state) => __state = __instance.isVisible;
-
-    static void Postfix(PQ __instance, bool __state)
-    {
-        if (__instance.isVisible != __state)
-            BatchPQS.OnQuadChanged(__instance);
     }
 }
 

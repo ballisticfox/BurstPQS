@@ -231,10 +231,19 @@ public class BatchPQS : MonoBehaviour
         Get(quad.sphereRoot)?.merger.MarkDirty(quad);
     }
 
-    // Called when a quad is subdivided, collapsed, shown or hidden.
+    // Called when stock shows or hides a quad's renderer outside BatchPQS.
     internal static void OnQuadChanged(PQ quad)
     {
         Get(quad.sphereRoot)?.merger.MarkChanged(quad);
+    }
+
+    /// <summary>
+    /// Tells BurstPQS that a mod changed a quad's materials, mesh or renderer
+    /// settings, so any merged draw that includes the quad is rebuilt.
+    /// </summary>
+    public static void OnQuadRendererChanged(PQ quad)
+    {
+        Get(quad.sphereRoot)?.merger.MarkRendererChanged(quad);
     }
 
     internal void UpdateLocalStorage()
@@ -1142,6 +1151,8 @@ public class BatchPQS : MonoBehaviour
                 if (!q.IsSafeToSubdivide() || !q.Subdivide())
                     continue;
 
+                batchPQS.merger.MarkChanged(q);
+
                 batchPQS.InvalidateQuadSnapshot(q);
                 foreach (var child in q.subNodes)
                     batchPQS.InvalidateQuadSnapshot(child);
@@ -1150,7 +1161,10 @@ public class BatchPQS : MonoBehaviour
             foreach (var q in collapseQuads)
             {
                 if (q.IsSafeToCollapse() && q.Collapse())
+                {
                     batchPQS.InvalidateQuadSnapshot(q);
+                    batchPQS.merger.MarkChanged(q);
+                }
             }
 
             bool modified = subdivideIndices.Length != 0 || collapseIndices.Length != 0;
@@ -1192,7 +1206,10 @@ public class BatchPQS : MonoBehaviour
         {
             q.UpdateVisibility();
             if (q.isVisible != batchPQS.snapshots[index].isVisible)
+            {
                 batchPQS.InvalidateQuadSnapshot(q);
+                batchPQS.merger.MarkChanged(q);
+            }
         }
 
         readonly List<PQ> ResolveQuads(NativeList<int> indices, List<PQ> quads)

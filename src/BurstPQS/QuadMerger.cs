@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using BurstPQS.Collections;
 using BurstPQS.Util;
 using Unity.Burst;
 using Unity.Collections;
@@ -30,10 +31,11 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
 {
     internal static bool Enabled = true;
 
-    // Families are checked when one of their quads changes. As a backstop for
-    // changes nothing reports (materials, renderers, meshes swapped by mods),
-    // this many families are also rechecked each frame.
-    const int ChecksPerFrame = 8;
+    // Families are checked when one of their quads changes, and mods report
+    // renderer changes through BatchPQS.OnQuadRendererChanged. As a backstop
+    // for changes nothing reports, this many families are also rechecked each
+    // frame.
+    const int ChecksPerFrame = 1;
 
     // A family that failed the renderer checks is retried after this many frames.
     const int RejectFrames = 60;
@@ -71,6 +73,24 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         // floats within its stream.
         public readonly int[] strides = new int[4];
         public readonly int[] offsets = new int[VertexAttributeCount];
+
+        // How each stream is read back, and its attribute if it has only one.
+        public readonly StreamKind[] kinds = new StreamKind[4];
+        public readonly VertexAttributeDescriptor[] single = new VertexAttributeDescriptor[4];
+    }
+
+    enum StreamKind
+    {
+        None,
+
+        // One attribute, uploaded straight from its getter.
+        Single,
+
+        // BatchPQS's interleaved stream, interleaved by Burst.
+        Interleaved,
+
+        // Anything else, interleaved as floats.
+        Floats,
     }
 
     sealed class Group
@@ -118,6 +138,8 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         VertexAttributeCount
     ];
     static readonly List<Vector2> Vector2Scratch = [];
+    static readonly List<Vector2> Uv2Scratch = [];
+    static readonly List<Vector2> Uv3Scratch = [];
     static readonly List<Vector3> Vector3Scratch = [];
     static readonly List<Vector4> Vector4Scratch = [];
     static readonly List<Color> ColorScratch = [];
@@ -160,6 +182,16 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         var parent = quad.parent;
         if (parent is not null)
             changed.Add(parent);
+    }
+
+    // A mod changed a quad's materials, mesh or renderer settings. Its family is
+    // taken apart, and formed again from the new state if it still matches.
+    internal void MarkRendererChanged(PQ quad)
+    {
+        var parent = quad.parent;
+        if (parent is not null && groups.TryGetValue(parent, out var group))
+            RemoveAt(group.index);
+        MarkChanged(quad);
     }
 
     bool TryGetSlice(PQ quad, out Group group, out int index)
@@ -753,33 +785,25 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         if (!SameLayout(shell.attributes, AttributeScratch, count))
             return false;
 
-        for (int stream = 0; stream < 4; ++stream)
-        {
-            int length = shell.strides[stream] * vertexCount;
-            if (StreamScratch[stream].Length < length)
-                StreamScratch[stream] = new float[length];
-        }
-
         var offset = SliceOffset(group, child);
-        foreach (var descriptor in shell.attributes)
-            ReadAttribute(source, descriptor, shell, offset, vertexCount);
-
         var mesh = shell.mesh;
         int baseVertex = index * vertexCount;
         for (int stream = 0; stream < 4; ++stream)
         {
-            int stride = shell.strides[stream];
-            if (stride == 0)
-                continue;
+            switch (shell.kinds[stream])
+            {
+                case StreamKind.Single:
+                    CopySingle(source, mesh, shell.single[stream], baseVertex, vertexCount);
+                    break;
 
-            mesh.SetVertexBufferData(
-                StreamScratch[stream],
-                0,
-                baseVertex * stride,
-                vertexCount * stride,
-                stream,
-                UpdateFlags
-            );
+                case StreamKind.Interleaved:
+                    CopyInterleaved(source, mesh, offset, stream, baseVertex, vertexCount);
+                    break;
+
+                case StreamKind.Floats:
+                    CopyFloats(source, shell, offset, stream, baseVertex, vertexCount);
+                    break;
+            }
         }
 
         source.GetIndices(IndexScratch, 0);
@@ -791,6 +815,203 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         bounds.center += offset;
         group.bounds[index] = bounds;
         return true;
+    }
+
+    // Uploads a stream holding only this attribute straight from its getter.
+    static void CopySingle(
+        Mesh source,
+        Mesh mesh,
+        VertexAttributeDescriptor descriptor,
+        int baseVertex,
+        int vertexCount
+    )
+    {
+        int stream = descriptor.stream;
+        switch (descriptor.attribute)
+        {
+            case VertexAttribute.Normal:
+                source.GetNormals(Vector3Scratch);
+                mesh.SetVertexBufferData(
+                    Vector3Scratch,
+                    0,
+                    baseVertex,
+                    vertexCount,
+                    stream,
+                    UpdateFlags
+                );
+                return;
+
+            case VertexAttribute.Tangent:
+                source.GetTangents(Vector4Scratch);
+                mesh.SetVertexBufferData(
+                    Vector4Scratch,
+                    0,
+                    baseVertex,
+                    vertexCount,
+                    stream,
+                    UpdateFlags
+                );
+                return;
+
+            case VertexAttribute.Color:
+                source.GetColors(ColorScratch);
+                mesh.SetVertexBufferData(
+                    ColorScratch,
+                    0,
+                    baseVertex,
+                    vertexCount,
+                    stream,
+                    UpdateFlags
+                );
+                return;
+        }
+
+        int channel = descriptor.attribute - VertexAttribute.TexCoord0;
+        switch (descriptor.dimension)
+        {
+            case 2:
+                source.GetUVs(channel, Vector2Scratch);
+                mesh.SetVertexBufferData(
+                    Vector2Scratch,
+                    0,
+                    baseVertex,
+                    vertexCount,
+                    stream,
+                    UpdateFlags
+                );
+                break;
+            case 3:
+                source.GetUVs(channel, Vector3Scratch);
+                mesh.SetVertexBufferData(
+                    Vector3Scratch,
+                    0,
+                    baseVertex,
+                    vertexCount,
+                    stream,
+                    UpdateFlags
+                );
+                break;
+            default:
+                source.GetUVs(channel, Vector4Scratch);
+                mesh.SetVertexBufferData(
+                    Vector4Scratch,
+                    0,
+                    baseVertex,
+                    vertexCount,
+                    stream,
+                    UpdateFlags
+                );
+                break;
+        }
+    }
+
+    // Uploads BatchPQS's interleaved stream: position, color, uv0, uv2, uv3.
+    static unsafe void CopyInterleaved(
+        Mesh source,
+        Mesh mesh,
+        Vector3 offset,
+        int stream,
+        int baseVertex,
+        int vertexCount
+    )
+    {
+        source.GetVertices(Vector3Scratch);
+        source.GetColors(ColorScratch);
+        source.GetUVs(0, Vector2Scratch);
+        source.GetUVs(2, Uv2Scratch);
+        source.GetUVs(3, Uv3Scratch);
+
+        var output = new NativeArray<InterleavedVertex>(
+            vertexCount,
+            Allocator.Temp,
+            NativeArrayOptions.UninitializedMemory
+        );
+        InterleaveFunc ??= BurstUtil.MaybeCompileDelegate<InterleaveDelegate>(Interleave);
+        fixed (Vector3* positions = NoAllocHelpers.ExtractArrayFromListT(Vector3Scratch))
+        fixed (Color* colors = NoAllocHelpers.ExtractArrayFromListT(ColorScratch))
+        fixed (Vector2* uv0s = NoAllocHelpers.ExtractArrayFromListT(Vector2Scratch))
+        fixed (Vector2* uv2s = NoAllocHelpers.ExtractArrayFromListT(Uv2Scratch))
+        fixed (Vector2* uv3s = NoAllocHelpers.ExtractArrayFromListT(Uv3Scratch))
+        {
+            InterleaveFunc(
+                new(positions, vertexCount),
+                new(colors, vertexCount),
+                new(uv0s, vertexCount),
+                new(uv2s, vertexCount),
+                new(uv3s, vertexCount),
+                new(output),
+                offset
+            );
+        }
+
+        mesh.SetVertexBufferData(output, 0, baseVertex, vertexCount, stream, UpdateFlags);
+        output.Dispose();
+    }
+
+    delegate void InterleaveDelegate(
+        in MemorySpan<Vector3> positions,
+        in MemorySpan<Color> colors,
+        in MemorySpan<Vector2> uv0s,
+        in MemorySpan<Vector2> uv2s,
+        in MemorySpan<Vector2> uv3s,
+        in MemorySpan<InterleavedVertex> output,
+        in Vector3 offset
+    );
+
+    static InterleaveDelegate InterleaveFunc;
+
+    [BurstCompile(FloatMode = FloatMode.Fast)]
+    static void Interleave(
+        in MemorySpan<Vector3> positions,
+        in MemorySpan<Color> colors,
+        in MemorySpan<Vector2> uv0s,
+        in MemorySpan<Vector2> uv2s,
+        in MemorySpan<Vector2> uv3s,
+        in MemorySpan<InterleavedVertex> output,
+        in Vector3 offset
+    )
+    {
+        for (int i = 0; i < output.Length; ++i)
+        {
+            output[i] = new InterleavedVertex
+            {
+                position = positions[i] + offset,
+                color = colors[i],
+                uv0 = uv0s[i],
+                uv2 = uv2s[i],
+                uv3 = uv3s[i],
+            };
+        }
+    }
+
+    // Interleaves any other stream as floats, one attribute at a time.
+    static void CopyFloats(
+        Mesh source,
+        Shell shell,
+        Vector3 offset,
+        int stream,
+        int baseVertex,
+        int vertexCount
+    )
+    {
+        int stride = shell.strides[stream];
+        if (StreamScratch[stream].Length < stride * vertexCount)
+            StreamScratch[stream] = new float[stride * vertexCount];
+
+        foreach (var descriptor in shell.attributes)
+        {
+            if (descriptor.stream == stream)
+                ReadAttribute(source, descriptor, shell, offset, vertexCount);
+        }
+
+        shell.mesh.SetVertexBufferData(
+            StreamScratch[stream],
+            0,
+            baseVertex * stride,
+            vertexCount * stride,
+            stream,
+            UpdateFlags
+        );
     }
 
     // Writes one attribute of a quad into its stream's scratch buffer.
@@ -959,6 +1180,7 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
 
         shell.attributes = new VertexAttributeDescriptor[count];
         System.Array.Copy(attributes, shell.attributes, count);
+        ClassifyStreams(shell);
 
         var mesh = shell.mesh;
         mesh.Clear();
@@ -966,6 +1188,60 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         mesh.SetIndexBufferParams(4 * IndicesPerQuad, IndexFormat.UInt16);
         mesh.subMeshCount = 1;
         return true;
+    }
+
+    static void ClassifyStreams(Shell shell)
+    {
+        for (int stream = 0; stream < 4; ++stream)
+        {
+            int count = 0;
+            foreach (var descriptor in shell.attributes)
+            {
+                if (descriptor.stream != stream)
+                    continue;
+                count++;
+                shell.single[stream] = descriptor;
+            }
+
+            var single = shell.single[stream];
+            if (count == 0)
+                shell.kinds[stream] = StreamKind.None;
+            else if (
+                count == 1
+                && single.attribute != VertexAttribute.Position
+                && (single.attribute < VertexAttribute.TexCoord0 || single.dimension >= 2)
+            )
+                shell.kinds[stream] = StreamKind.Single;
+            else if (IsInterleavedVertex(shell, stream))
+                shell.kinds[stream] = StreamKind.Interleaved;
+            else
+                shell.kinds[stream] = StreamKind.Floats;
+        }
+    }
+
+    // Whether the stream is laid out exactly as InterleavedVertex.
+    static bool IsInterleavedVertex(Shell shell, int stream)
+    {
+        int matched = 0;
+        foreach (var descriptor in shell.attributes)
+        {
+            if (descriptor.stream != stream)
+                continue;
+
+            int expected = descriptor.attribute switch
+            {
+                VertexAttribute.Position => 3,
+                VertexAttribute.Color => 4,
+                VertexAttribute.TexCoord0 => 2,
+                VertexAttribute.TexCoord2 => 2,
+                VertexAttribute.TexCoord3 => 2,
+                _ => -1,
+            };
+            if (descriptor.dimension != expected)
+                return false;
+            matched++;
+        }
+        return matched == 5;
     }
     #endregion
 }
