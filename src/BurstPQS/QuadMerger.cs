@@ -23,9 +23,11 @@ namespace BurstPQS;
 // for mods.
 //
 // The family mesh has the same vertex layout as its quads, with each quad in
-// its own slice. When a family forms, its quads are read back from their
-// meshes. After that, every write BatchPQS makes to a quad's mesh is also
-// made to its slice, so quads never need to be read back again.
+// its own slice. A family forms as soon as its parent subdivides, so each
+// child's build is written into its slice as it completes, and every later
+// write BatchPQS makes to a quad's mesh is made to its slice too. Only quads
+// that were built before their family formed (after a collapse, or when cached
+// children come back) are read back from their meshes.
 [BurstCompile]
 internal sealed class QuadMerger(BatchPQS batchPQS)
 {
@@ -102,6 +104,10 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
 
         // Children whose slice is out of date and must be read back.
         public int stale = 0xF;
+
+        // Whether all four children are built, visible and render alike. Until
+        // then the family is pending and its children draw themselves.
+        public bool ready;
 
         // Whether the family mesh is drawn instead of the children.
         public bool merged;
@@ -236,10 +242,13 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         Bounds bounds
     )
     {
-        if (!TryGetMirror(quad, out var group, out int index))
+        if (!TryGetSlice(quad, out var group, out int index))
             return;
 
+        // A build writes every stream, so it also fills a stale slice.
         var shell = group.shell;
+        if (shell.attributes is null && group.stale == 0xF)
+            CreateMesh(shell, attributes, attributes.Length);
         if (!SameLayout(shell.attributes, attributes, attributes.Length))
         {
             MarkDirty(quad);
@@ -277,6 +286,8 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         bounds.center += offset;
         group.bounds[index] = bounds;
         UpdateBounds(group);
+        group.stale &= ~(1 << index);
+        Queue(group);
 
         MirroredWrites++;
         MirrorTicks += Stopwatch.GetTimestamp() - start;
@@ -390,7 +401,7 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         {
             checkCursor %= groupList.Count;
             var group = groupList[checkCursor];
-            if (IsIntact(group) && StillRendersAlike(group))
+            if (IsIntact(group) && UpdateReady(group))
             {
                 checkCursor++;
                 continue;
@@ -407,18 +418,24 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         {
             if (groups.TryGetValue(quad, out var group))
             {
-                if (IsIntact(group) && StillRendersAlike(group))
+                if (IsIntact(group) && UpdateReady(group))
                     continue;
                 RemoveAt(group.index);
             }
 
-            if (rejected.Contains(quad) || !IsFamily(quad))
+            if (rejected.Contains(quad) || !IsLeafFamily(quad))
                 continue;
 
-            if (DrawsAlike(quad))
+            // Families waiting on builds form now, so the builds fill them.
+            if (IsFamily(quad))
+            {
+                if (DrawsAlike(quad))
+                    Add(quad).ready = true;
+                else
+                    rejected.Add(quad);
+            }
+            else if (HasUnbuiltChild(quad))
                 Add(quad);
-            else
-                rejected.Add(quad);
         }
         changed.Clear();
 
@@ -429,7 +446,7 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         foreach (var group in copyQueue)
         {
             group.queued = false;
-            if (group.failed || group.removed)
+            if (group.failed || group.removed || !group.ready)
                 continue;
 
             if (group.stale != 0)
@@ -487,7 +504,7 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
     #endregion
 
     #region Groups
-    void Add(PQ parent)
+    Group Add(PQ parent)
     {
         var shell = AcquireShell(parent);
         var group = new Group { parent = parent, shell = shell };
@@ -499,6 +516,31 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         groups.Add(parent, group);
         groupList.Add(group);
         Queue(group);
+        return group;
+    }
+
+    // Moves a family between pending and ready as its children are built,
+    // shown and hidden. False if it should be dissolved.
+    bool UpdateReady(Group group)
+    {
+        if (!IsFamily(group.parent))
+        {
+            group.ready = false;
+            SetMerged(group, false);
+            return true;
+        }
+
+        if (group.ready)
+            return StillRendersAlike(group);
+
+        if (!DrawsAlike(group.parent))
+            return false;
+
+        // Builds can change materials, so match the renderer again.
+        group.ready = true;
+        SyncRenderer(group);
+        Queue(group);
+        return true;
     }
 
     void RemoveAt(int index)
@@ -592,11 +634,11 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
     #endregion
 
     #region Checks
-    // Whether this group's quads are still the visible children of its parent.
+    // Whether this group's quads are still the leaf children of its parent.
     // Only reads PQ fields.
     static bool IsIntact(Group group)
     {
-        if (!IsFamily(group.parent))
+        if (!IsLeafFamily(group.parent))
             return false;
 
         var subNodes = group.parent.subNodes;
@@ -608,8 +650,8 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
         return true;
     }
 
-    // Whether all four children of this quad are visible leaves.
-    static bool IsFamily(PQ parent)
+    // Whether all four children of this quad are leaves, built or not.
+    static bool IsLeafFamily(PQ parent)
     {
         if (
             parent.IsNullOrDestroyed()
@@ -625,17 +667,34 @@ internal sealed class QuadMerger(BatchPQS batchPQS)
 
         foreach (var child in subNodes)
         {
-            if (
-                child.IsNullOrDestroyed()
-                || !child.isActive
-                || !child.isBuilt
-                || child.isSubdivided
-                || !child.isVisible
-                || child.isForcedInvisible
-            )
+            if (child.IsNullOrDestroyed() || !child.isActive || child.isSubdivided)
                 return false;
         }
         return true;
+    }
+
+    // Whether all four children of this quad are built, visible leaves.
+    static bool IsFamily(PQ parent)
+    {
+        if (!IsLeafFamily(parent))
+            return false;
+
+        foreach (var child in parent.subNodes)
+        {
+            if (!child.isBuilt || !child.isVisible || child.isForcedInvisible)
+                return false;
+        }
+        return true;
+    }
+
+    static bool HasUnbuiltChild(PQ parent)
+    {
+        foreach (var child in parent.subNodes)
+        {
+            if (!child.isBuilt)
+                return true;
+        }
+        return false;
     }
 
     // Whether all four children render, and render the same way.
